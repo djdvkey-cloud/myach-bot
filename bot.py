@@ -398,29 +398,32 @@ async def maybe_send_poll():
 async def main():
     print(f"Запуск бота {datetime.datetime.now(YEKB_TZ)}")
 
-    await maybe_send_poll()
-
-    offset = load_offset()
     try:
-        updates = await bot.get_updates(offset=offset, timeout=20, limit=50)
-    except Exception as e:
-        print(f"Ошибка getUpdates: {e}")
-        return
+        await maybe_send_poll()
 
-    if not updates:
-        print("Новых сообщений нет")
-        return
-
-    max_id = offset
-    for update in updates:
-        max_id = max(max_id, update.update_id + 1)
+        offset = load_offset()
         try:
-            await dp.feed_update(bot, update)
+            updates = await bot.get_updates(offset=offset, timeout=20, limit=50)
         except Exception as e:
-            print(f"Ошибка обработки update {update.update_id}: {e}")
+            print(f"Ошибка getUpdates: {e}")
+            return
 
-    save_offset(max_id)
-    print(f"Обработано обновлений: {len(updates)}, новый offset: {max_id}")
+        if not updates:
+            print("Новых сообщений нет")
+            return
+
+        max_id = offset
+        for update in updates:
+            max_id = max(max_id, update.update_id + 1)
+            try:
+                await dp.feed_update(bot, update)
+            except Exception as e:
+                print(f"Ошибка обработки update {update.update_id}: {e}")
+
+        save_offset(max_id)
+        print(f"Обработано обновлений: {len(updates)}, новый offset: {max_id}")
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
