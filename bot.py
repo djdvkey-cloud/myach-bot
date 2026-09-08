@@ -2,7 +2,6 @@
 Футбольный бот «Мяч» — версия для GitHub Actions
 Опросы по субботам + команды статистики и составов
 """
-
 import asyncio
 import datetime
 import json
@@ -140,10 +139,17 @@ def teams_and_bench_size(n: int):
     return 2, 0
 
 
-def is_allowed(message: types.Message) -> bool:
+# Команды, доступные любому участнику чата — то, чем пользуются каждую игру.
+# «Переименовать» и «обнулить» — только владельцу, это не игровые действия.
+OPEN_COMMANDS = {"матч", "статистика", "составы", "отменить", "start", "help", "id"}
+
+
+def is_allowed(message: types.Message, command: str = "") -> bool:
     if message.from_user and message.from_user.id == OWNER_ID:
         return True
-    return message.chat.id == CHAT_ID
+    if command in OPEN_COMMANDS:
+        return message.chat.id == CHAT_ID
+    return False
 
 
 def target_chat(message: types.Message) -> int:
@@ -152,7 +158,7 @@ def target_chat(message: types.Message) -> int:
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    if not is_allowed(message):
+    if not is_allowed(message, "start"):
         return
     await message.answer(
         f"Привет, {message.from_user.first_name}!\n"
@@ -163,7 +169,7 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
-    if not is_allowed(message):
+    if not is_allowed(message, "help"):
         return
     await message.answer(
         "Команды:\n"
@@ -180,7 +186,7 @@ async def cmd_help(message: types.Message):
 
 @dp.message(Command("id"))
 async def cmd_id(message: types.Message):
-    if not is_allowed(message):
+    if not is_allowed(message, "id"):
         return
     await message.answer(
         f"ID чата: `{message.chat.id}`\n"
@@ -191,7 +197,7 @@ async def cmd_id(message: types.Message):
 
 @dp.message(Command("матч"))
 async def cmd_match(message: types.Message, command: CommandObject):
-    if not is_allowed(message):
+    if not is_allowed(message, "матч"):
         return
     usage = (
         "Формат:\n"
@@ -201,12 +207,10 @@ async def cmd_match(message: types.Message, command: CommandObject):
     if not command.args:
         await message.answer(usage)
         return
-
     players, errors = parse_match_line(command.args)
     if not players:
         await message.answer(f"Не понял игроков.\n{usage}")
         return
-
     stats = load_stats()
     chat = stats.setdefault(str(target_chat(message)), {"players": {}, "last": []})
     for name, goals, assists in players:
@@ -216,7 +220,6 @@ async def cmd_match(message: types.Message, command: CommandObject):
         rec["assists"] += assists
     chat["last"] = [list(p) for p in players]
     save_stats(stats)
-
     lines = [f"Записал игру ({len(players)} чел.):"]
     for name, g, a in players:
         lines.append(f"• {name}: {g}+{a}")
@@ -227,16 +230,14 @@ async def cmd_match(message: types.Message, command: CommandObject):
 
 @dp.message(Command("статистика"))
 async def cmd_stats(message: types.Message):
-    if not is_allowed(message):
+    if not is_allowed(message, "статистика"):
         return
     chat_stats = load_stats().get(str(target_chat(message)), {}).get("players", {})
     if not chat_stats:
         await message.answer("Статистики пока нет.\nДобавьте игру: /матч Иванов 2+1")
         return
-
     rows = [(koef_of(r), points_of(r), name, r) for name, r in chat_stats.items()]
     rows.sort(reverse=True)
-
     lines = [
         "📊 Статистика",
         "Гол = 2 очка, пас = 1 очко\n"
@@ -252,7 +253,7 @@ async def cmd_stats(message: types.Message):
 
 @dp.message(Command("отменить"))
 async def cmd_undo(message: types.Message):
-    if not is_allowed(message):
+    if not is_allowed(message, "отменить"):
         return
     stats = load_stats()
     chat = stats.setdefault(str(target_chat(message)), {"players": {}, "last": []})
@@ -260,7 +261,6 @@ async def cmd_undo(message: types.Message):
     if not last:
         await message.answer("Нечего отменять.")
         return
-
     for name, goals, assists in last:
         rec = chat["players"].get(name)
         if not rec:
@@ -277,7 +277,7 @@ async def cmd_undo(message: types.Message):
 
 @dp.message(Command("переименовать"))
 async def cmd_rename(message: types.Message, command: CommandObject):
-    if not is_allowed(message):
+    if not is_allowed(message, "переименовать"):
         return
     if not command.args or "=" not in command.args:
         await message.answer("Формат: /переименовать Старое = Новое")
@@ -301,7 +301,7 @@ async def cmd_rename(message: types.Message, command: CommandObject):
 
 @dp.message(Command("обнулить"))
 async def cmd_reset(message: types.Message, command: CommandObject):
-    if not is_allowed(message):
+    if not is_allowed(message, "обнулить"):
         return
     if (command.args or "").strip().lower() != "да":
         await message.answer("Чтобы стереть статистику, напишите:\n/обнулить да")
@@ -314,7 +314,7 @@ async def cmd_reset(message: types.Message, command: CommandObject):
 
 @dp.message(Command("составы"))
 async def cmd_lineups(message: types.Message, command: CommandObject):
-    if not is_allowed(message):
+    if not is_allowed(message, "составы"):
         return
     usage = (
         "Формат:\n"
@@ -325,12 +325,10 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
     if not command.args:
         await message.answer(usage)
         return
-
     names = [x.strip().title() for x in command.args.split(",") if x.strip()]
     if not names:
         await message.answer(usage)
         return
-
     chat_players = load_stats().get(str(target_chat(message)), {}).get("players", {})
     players = []
     unknown = []
@@ -341,12 +339,10 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
             unknown.append(name)
         players.append((name, koef))
     players.sort(key=lambda x: -x[1])
-
     team_count, bench_size = teams_and_bench_size(len(players))
     bench = players[-bench_size:] if bench_size else []
     playing = players[:-bench_size] if bench_size else players
     teams = snake_teams(playing, team_count)
-
     lines = [f"⚖️ Составы — {len(players)} игроков, {team_count} команд\n"]
     for i, team in enumerate(teams, 1):
         avg = sum(k for _, k in team) / len(team) if team else 0
@@ -367,7 +363,6 @@ async def maybe_send_poll():
         return
     if not (11 <= now.hour <= 13):
         return
-
     today = now.date()
     last = None
     if os.path.exists(LAST_POLL_FILE):
@@ -378,7 +373,6 @@ async def maybe_send_poll():
             pass
     if last == today:
         return
-
     monday = today + datetime.timedelta(days=2)
     question = f"Футбол Лестех понедельник {monday.strftime('%d.%m.%Y')} {GAME_TIME}"
     try:
@@ -397,21 +391,17 @@ async def maybe_send_poll():
 
 async def main():
     print(f"Запуск бота {datetime.datetime.now(YEKB_TZ)}")
-
     try:
         await maybe_send_poll()
-
         offset = load_offset()
         try:
             updates = await bot.get_updates(offset=offset, timeout=20, limit=50)
         except Exception as e:
             print(f"Ошибка getUpdates: {e}")
             return
-
         if not updates:
             print("Новых сообщений нет")
             return
-
         max_id = offset
         for update in updates:
             max_id = max(max_id, update.update_id + 1)
@@ -419,7 +409,6 @@ async def main():
                 await dp.feed_update(bot, update)
             except Exception as e:
                 print(f"Ошибка обработки update {update.update_id}: {e}")
-
         save_offset(max_id)
         print(f"Обработано обновлений: {len(updates)}, новый offset: {max_id}")
     finally:
