@@ -32,7 +32,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           OWNER_ID: ${{ secrets.OWNER_ID }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python bot.py
+        run: python myach-bot-fixed.py
 
       - name: Commit and push changes
         run: |
