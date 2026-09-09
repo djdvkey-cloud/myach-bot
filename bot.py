@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 import re
+from itertools import combinations
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, types
@@ -109,22 +110,35 @@ def parse_match_line(text: str):
     return players, errors
 
 
-def snake_teams(players: list, team_count: int):
-    teams = [[] for _ in range(team_count)]
-    i, forward = 0, True
-    for p in players:
-        teams[i].append(p)
-        if forward:
-            if i == team_count - 1:
-                forward = False
-            else:
-                i += 1
-        else:
-            if i == 0:
-                forward = True
-            else:
-                i -= 1
-    return teams
+def optimal_teams(players: list, team_count: int) -> list:
+    """Полным перебором ищет разбиение на team_count равных по размеру
+    команд с минимальным разбросом суммы коэффициентов между командами.
+    Игроков не больше 15, поэтому перебор быстрый даже в худшем случае."""
+    n = len(players)
+    size = n // team_count
+    indices = list(range(n))
+    best_spread, best_groups = None, None
+
+    if team_count == 2:
+        for combo in combinations(indices, size):
+            g1 = combo
+            g2 = tuple(i for i in indices if i not in combo)
+            s1 = sum(players[i][1] for i in g1)
+            s2 = sum(players[i][1] for i in g2)
+            spread = abs(s1 - s2)
+            if best_spread is None or spread < best_spread:
+                best_spread, best_groups = spread, (g1, g2)
+    else:  # team_count == 3
+        for g1 in combinations(indices, size):
+            rest = [i for i in indices if i not in g1]
+            for g2 in combinations(rest, size):
+                g3 = tuple(i for i in rest if i not in g2)
+                sums = [sum(players[i][1] for i in g) for g in (g1, g2, g3)]
+                spread = max(sums) - min(sums)
+                if best_spread is None or spread < best_spread:
+                    best_spread, best_groups = spread, (g1, g2, g3)
+
+    return [[players[i] for i in group] for group in best_groups]
 
 
 def teams_and_bench_size(n: int):
@@ -320,7 +334,8 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
         "Формат:\n"
         "/составы Иванов, Петров, Сидоров, ...\n\n"
         "10 человек → 2 команды, 15 → 3 команды.\n"
-        "Команды собираются змейкой по коэффициенту."
+        "Составы подбираются полным перебором — минимальный возможный "
+        "разброс между командами по коэффициенту."
     )
     if not command.args:
         await message.answer(usage)
@@ -342,7 +357,7 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
     team_count, bench_size = teams_and_bench_size(len(players))
     bench = players[-bench_size:] if bench_size else []
     playing = players[:-bench_size] if bench_size else players
-    teams = snake_teams(playing, team_count)
+    teams = optimal_teams(playing, team_count)
     lines = [f"⚖️ Составы — {len(players)} игроков, {team_count} команд\n"]
     for i, team in enumerate(teams, 1):
         avg = sum(k for _, k in team) / len(team) if team else 0
