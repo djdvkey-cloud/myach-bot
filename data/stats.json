@@ -2,69 +2,69 @@
   "-5022330317": {
     "players": {
       "Мбаппе": {
-        "games": 1,
-        "goals": 2,
-        "assists": 1
+        "games": 2,
+        "goals": 4,
+        "assists": 2
       },
       "Роналду": {
-        "games": 1,
-        "goals": 3,
-        "assists": 3
+        "games": 2,
+        "goals": 6,
+        "assists": 6
       },
       "Месси": {
-        "games": 1,
+        "games": 2,
         "goals": 0,
-        "assists": 1
+        "assists": 2
       },
       "Суарес": {
-        "games": 1,
-        "goals": 2,
-        "assists": 2
+        "games": 2,
+        "goals": 4,
+        "assists": 4
       },
       "Ройс": {
-        "games": 1,
-        "goals": 0,
-        "assists": 1
-      },
-      "Холанд": {
-        "games": 1,
-        "goals": 1,
-        "assists": 1
-      },
-      "Леау": {
-        "games": 1,
-        "goals": 2,
-        "assists": 0
-      },
-      "Онопко": {
-        "games": 1,
+        "games": 2,
         "goals": 0,
         "assists": 2
       },
-      "Карпин": {
-        "games": 1,
-        "goals": 1,
-        "assists": 3
+      "Холанд": {
+        "games": 2,
+        "goals": 2,
+        "assists": 2
       },
-      "Батраков": {
-        "games": 1,
+      "Леау": {
+        "games": 2,
         "goals": 4,
         "assists": 0
       },
+      "Онопко": {
+        "games": 2,
+        "goals": 0,
+        "assists": 4
+      },
+      "Карпин": {
+        "games": 2,
+        "goals": 2,
+        "assists": 6
+      },
+      "Батраков": {
+        "games": 2,
+        "goals": 8,
+        "assists": 0
+      },
       "Ишков": {
-        "games": 1,
-        "goals": 3,
+        "games": 2,
+        "goals": 6,
         "assists": 0
       },
       "Гогниев": {
-        "games": 1,
-        "goals": 2,
-        "assists": 1
+        "games": 2,
+        "goals": 4,
+        "assists": 2
       },
       "Абрамов": {
-        "games": 1,
-        "goals": 2,
-        "assists": 3
+        "games": 2,
+        "goals": 4,
+        "assists": 6
       },
       "Соколов": {
         "games": 1,
@@ -142,16 +142,6 @@
         "Абрамов",
         2,
         3
-      ],
-      [
-        "Соколов",
-        1,
-        0
-      ],
-      [
-        "Левандовский",
-        2,
-        2
       ]
     ]
   }
