@@ -110,47 +110,110 @@ def parse_match_line(text: str):
     return players, errors
 
 
-def optimal_teams(players: list, team_count: int) -> list:
-    """Полным перебором ищет разбиение на team_count равных по размеру
-    команд с минимальным разбросом суммы коэффициентов между командами.
-    Игроков не больше 15, поэтому перебор быстрый даже в худшем случае."""
-    n = len(players)
-    size = n // team_count
-    indices = list(range(n))
+EXACT_LIMIT = 15  # до 15 игроков — точный перебор, дальше — эвристика
+                  # (перебор от 16 игроков уже занимает больше 5 секунд)
+
+
+def team_count_for(n: int) -> int:
+    """2 команды, если играющих меньше 15, иначе 3."""
+    return 3 if n >= 15 else 2
+
+
+def team_sizes(n: int, team_count: int) -> list:
+    """Размеры команд максимально равные — отличаются не больше чем на 1."""
+    base = n // team_count
+    extra = n % team_count
+    return [base + 1] * extra + [base] * (team_count - extra)
+
+
+def exact_split(players: list, team_count: int):
+    """Точный перебор всех вариантов — минимизирует разброс СРЕДНЕГО
+    коэффициента между командами (не суммы — размеры команд могут
+    отличаться, и по сумме команда с меньшим числом игроков нечестно
+    выигрывает)."""
+    sizes = team_sizes(len(players), team_count)
+    indices = list(range(len(players)))
     best_spread, best_groups = None, None
 
-    if team_count == 2:
-        for combo in combinations(indices, size):
-            g1 = combo
-            g2 = tuple(i for i in indices if i not in combo)
-            s1 = sum(players[i][1] for i in g1)
-            s2 = sum(players[i][1] for i in g2)
-            spread = abs(s1 - s2)
+    def helper(remaining, sizes_left, groups):
+        nonlocal best_spread, best_groups
+        if not sizes_left:
+            avgs = [sum(players[i][1] for i in g) / len(g) for g in groups]
+            spread = max(avgs) - min(avgs)
             if best_spread is None or spread < best_spread:
-                best_spread, best_groups = spread, (g1, g2)
-    else:  # team_count == 3
-        for g1 in combinations(indices, size):
-            rest = [i for i in indices if i not in g1]
-            for g2 in combinations(rest, size):
-                g3 = tuple(i for i in rest if i not in g2)
-                sums = [sum(players[i][1] for i in g) for g in (g1, g2, g3)]
-                spread = max(sums) - min(sums)
-                if best_spread is None or spread < best_spread:
-                    best_spread, best_groups = spread, (g1, g2, g3)
+                best_spread, best_groups = spread, [list(g) for g in groups]
+            return
+        size = sizes_left[0]
+        for combo in combinations(remaining, size):
+            rest = [i for i in remaining if i not in combo]
+            helper(rest, sizes_left[1:], groups + [combo])
 
-    return [[players[i] for i in group] for group in best_groups]
+    helper(indices, sizes, [])
+    return [[players[i] for i in g] for g in best_groups], best_spread
 
 
-def teams_and_bench_size(n: int):
-    if n == 10:
-        return 2, 0
-    if n == 15:
-        return 3, 0
-    if 10 < n < 15:
-        return 2, n - 10
-    if n > 15:
-        return 3, n - 15
-    return 2, 0
+def heuristic_split(players: list, team_count: int, iterations: int = 3000):
+    """Для больших групп (перебор нереален): раскладка змейкой с учётом
+    целевых размеров команд, затем локальные обмены игроками между
+    самой сильной и самой слабой командой, пока это уменьшает разброс
+    средних. Быстро (доли секунды) даже на 30+ игроках."""
+    sorted_p = sorted(range(len(players)), key=lambda i: -players[i][1])
+    sizes = team_sizes(len(players), team_count)
+    teams = [[] for _ in range(team_count)]
+    ti, forward = 0, True
+    for idx in sorted_p:
+        while len(teams[ti]) >= sizes[ti]:
+            ti = (ti + 1) % team_count
+        teams[ti].append(idx)
+        if forward:
+            if ti == team_count - 1:
+                forward = False
+            else:
+                ti += 1
+        else:
+            if ti == 0:
+                forward = True
+            else:
+                ti -= 1
+        ti = ti % team_count
+
+    def team_avg(t):
+        return sum(players[i][1] for i in t) / len(t)
+
+    improved, it = True, 0
+    while improved and it < iterations:
+        improved = False
+        it += 1
+        avgs = [team_avg(t) for t in teams]
+        hi, lo = avgs.index(max(avgs)), avgs.index(min(avgs))
+        if hi == lo:
+            break
+        best_gain, best_swap = 0, None
+        for a in teams[hi]:
+            for b in teams[lo]:
+                new_avgs = avgs[:]
+                new_avgs[hi] = (sum(players[i][1] for i in teams[hi]) - players[a][1] + players[b][1]) / len(teams[hi])
+                new_avgs[lo] = (sum(players[i][1] for i in teams[lo]) - players[b][1] + players[a][1]) / len(teams[lo])
+                old_spread = max(avgs) - min(avgs)
+                new_spread = max(new_avgs) - min(new_avgs)
+                if old_spread - new_spread > best_gain:
+                    best_gain, best_swap = old_spread - new_spread, (a, b)
+        if best_swap:
+            a, b = best_swap
+            teams[hi].remove(a); teams[hi].append(b)
+            teams[lo].remove(b); teams[lo].append(a)
+            improved = True
+
+    final_avgs = [team_avg(t) for t in teams]
+    return [[players[i] for i in t] for t in teams], max(final_avgs) - min(final_avgs)
+
+
+def split_teams(players: list, team_count: int):
+    """players — список (имя, коэффициент). Выбирает точный или
+    приближённый метод в зависимости от числа игроков."""
+    if len(players) <= EXACT_LIMIT:
+        return exact_split(players, team_count)
+    return heuristic_split(players, team_count)
 
 
 # Команды, доступные любому участнику чата — то, чем пользуются каждую игру.
@@ -333,9 +396,11 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
     usage = (
         "Формат:\n"
         "/составы Иванов, Петров, Сидоров, ...\n\n"
-        "10 человек → 2 команды, 15 → 3 команды.\n"
-        "Составы подбираются полным перебором — минимальный возможный "
-        "разброс между командами по коэффициенту."
+        "Меньше 15 человек → 2 команды, 15 и больше → 3 команды.\n"
+        "Все введённые играют, запасных нет — размеры команд могут "
+        "отличаться на 1 человека. Составы подбираются точным перебором "
+        "(до 15 игроков) или эвристикой (больше), чтобы средний "
+        "коэффициент команд был как можно ближе."
     )
     if not command.args:
         await message.answer(usage)
@@ -353,22 +418,16 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
         if not rec or not rec.get("games"):
             unknown.append(name)
         players.append((name, koef))
-    players.sort(key=lambda x: -x[1])
-    team_count, bench_size = teams_and_bench_size(len(players))
-    bench = players[-bench_size:] if bench_size else []
-    playing = players[:-bench_size] if bench_size else players
-    teams = optimal_teams(playing, team_count)
-    lines = [f"⚖️ Составы — {len(players)} игроков, {team_count} команд\n"]
+    team_count = team_count_for(len(players))
+    teams, spread = split_teams(players, team_count)
+    lines = [f"⚖️ Составы — {len(players)} игроков, {team_count} команды\n"]
     for i, team in enumerate(teams, 1):
         avg = sum(k for _, k in team) / len(team) if team else 0
-        lines.append(f"Команда {i} (ср. коэф. {avg:.2f}):")
+        lines.append(f"Команда {i} (средний коэф. {avg:.2f}):")
         lines += [f"• {n} — {k:.2f}" for n, k in team]
         lines.append("")
-    if bench:
-        lines.append("Запасные:")
-        lines += [f"• {n} — {k:.2f}" for n, k in bench]
     if unknown:
-        lines.append(f"\nБез статистики (коэф. 0): {', '.join(unknown)}")
+        lines.append(f"Без статистики (коэф. 0): {', '.join(unknown)}")
     await message.answer("\n".join(lines).strip())
 
 
