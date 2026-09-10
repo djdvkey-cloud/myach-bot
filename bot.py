@@ -36,6 +36,7 @@ ASSIST_POINTS = 1.0
 GAME_TOTAL_RUB = 4500
 PAYMENT_PHONE = "+79058056264"
 PAYMENT_BANK = "Озон Банк"
+BALL_FUND_RUB = 20  # надбавка сверху — копим на новый мяч
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -101,8 +102,10 @@ def fmt_num(v: float) -> str:
 
 
 def calc_payment_per_player(total: int, n: int) -> int:
-    """Делит total на n игроков, округляет вверх до ближайших 10 руб."""
-    return math.ceil((total / n) / 10) * 10
+    """Делит total на n игроков, округляет вверх до ближайших
+    10 руб., затем добавляет надбавку на новый мяч."""
+    rounded = math.ceil((total / n) / 10) * 10
+    return rounded + BALL_FUND_RUB
 
 
 def parse_match_line(text: str):
