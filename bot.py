@@ -5,6 +5,7 @@
 import asyncio
 import datetime
 import json
+import math
 import os
 import re
 from itertools import combinations
@@ -30,6 +31,11 @@ LAST_POLL_FILE = os.path.join(DATA_DIR, "last_poll.txt")
 # Очки
 GOAL_POINTS = 2.0
 ASSIST_POINTS = 1.0
+
+# Оплата за игру
+GAME_TOTAL_RUB = 4500
+PAYMENT_PHONE = "+79058056264"
+PAYMENT_BANK = "Озон Банк"
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -92,6 +98,11 @@ def koef_of(rec: dict) -> float:
 
 def fmt_num(v: float) -> str:
     return f"{v:g}"
+
+
+def calc_payment_per_player(total: int, n: int) -> int:
+    """Делит total на n игроков, округляет вверх до ближайших 10 руб."""
+    return math.ceil((total / n) / 10) * 10
 
 
 def parse_match_line(text: str):
@@ -218,7 +229,7 @@ def split_teams(players: list, team_count: int):
 
 # Команды, доступные любому участнику чата — то, чем пользуются каждую игру.
 # «Переименовать» и «обнулить» — только владельцу, это не игровые действия.
-OPEN_COMMANDS = {"матч", "статистика", "составы", "отменить", "start", "help", "id"}
+OPEN_COMMANDS = {"матч", "статистика", "составы", "отменить", "оплата", "start", "help", "id"}
 
 
 def is_allowed(message: types.Message, command: str = "") -> bool:
@@ -254,6 +265,7 @@ async def cmd_help(message: types.Message):
         "/статистика — таблица\n"
         "/составы Иванов, Петров, ... — разбить на команды\n"
         "/отменить — убрать последнюю игру\n"
+        "/оплата N — разделить сумму за игру на N человек\n"
         "/переименовать Старое = Новое\n"
         "/обнулить да — стереть статистику\n"
         "/id — узнать ID\n\n"
@@ -303,6 +315,25 @@ async def cmd_match(message: types.Message, command: CommandObject):
     if errors:
         lines.append(f"\nНе разобрал: {', '.join(errors)}")
     await message.answer("\n".join(lines))
+
+
+@dp.message(Command("оплата"))
+async def cmd_payment(message: types.Message, command: CommandObject):
+    if not is_allowed(message, "оплата"):
+        return
+    args = (command.args or "").strip()
+    if not args.isdigit() or int(args) <= 0:
+        await message.answer("Формат: /оплата N — где N число игравших сегодня, например /оплата 14")
+        return
+    n = int(args)
+    if n > 30:
+        await message.answer(f"Многовато — {n} человек? Проверьте число.")
+        return
+    per_player = calc_payment_per_player(GAME_TOTAL_RUB, n)
+    await message.answer(
+        f"Переводим по {per_player} рублей по номеру телефона "
+        f"{PAYMENT_PHONE}. Только {PAYMENT_BANK}."
+    )
 
 
 @dp.message(Command("статистика"))
