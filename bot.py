@@ -568,7 +568,8 @@ async def maybe_send_poll():
     now = datetime.datetime.now(YEKB_TZ)
     if now.weekday() != 5:  # суббота
         return
-    if not (11 <= now.hour <= 13):
+    # При перезапуске в течение часа всё равно отправим опрос, но не раньше 12:00.
+    if now.hour != 12:
         return
     today = now.date()
     last = None
