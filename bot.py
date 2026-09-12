@@ -563,6 +563,44 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
     await message.answer("\n".join(lines).strip())
 
 
+async def create_game_poll(chat_id: int):
+    now = datetime.datetime.now(YEKB_TZ)
+    today = now.date()
+    days_until_monday = (7 - today.weekday()) % 7
+    if days_until_monday == 0:
+        days_until_monday = 7
+    monday = today + datetime.timedelta(days=days_until_monday)
+    question = f"Футбол Лестех понедельник {monday.strftime('%d.%m.%Y')} {GAME_TIME}"
+    poll_message = await bot.send_poll(
+        chat_id=chat_id,
+        question=question,
+        options=["+", "-"],
+        is_anonymous=False,
+    )
+    with open(LAST_POLL_FILE, "w") as f:
+        f.write(today.isoformat())
+    save_json(POLL_STATE_FILE, {
+        "poll_id": poll_message.poll.id,
+        "message_id": poll_message.message_id,
+        "date": today.isoformat(),
+        "voters": {},
+    })
+    print(f"Опрос отправлен: {question}")
+    return question
+
+
+@dp.message(Command("опрос"))
+async def cmd_poll(message: types.Message):
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return
+    try:
+        question = await create_game_poll(CHAT_ID)
+        if message.chat.id != CHAT_ID:
+            await message.answer(f"Опрос отправлен в общий чат: {question}")
+    except Exception as e:
+        await message.answer(f"Не удалось отправить опрос: {e}")
+
+
 async def maybe_send_poll():
     now = datetime.datetime.now(YEKB_TZ)
     if now.weekday() != 5:  # суббота
@@ -580,20 +618,8 @@ async def maybe_send_poll():
             pass
     if last == today:
         return
-    monday = today + datetime.timedelta(days=2)
-    question = f"Футбол Лестех понедельник {monday.strftime('%d.%m.%Y')} {GAME_TIME}"
     try:
-        poll_message = await bot.send_poll(
-            chat_id=CHAT_ID,
-            question=question,
-            options=["+", "-"],
-            is_anonymous=False,
-        )
-        with open(LAST_POLL_FILE, "w") as f:
-            f.write(today.isoformat())
-        save_json(POLL_STATE_FILE, {"poll_id": poll_message.poll.id, "message_id": poll_message.message_id,
-                                    "date": today.isoformat(), "voters": {}})
-        print(f"Опрос отправлен: {question}")
+        await create_game_poll(CHAT_ID)
     except Exception as e:
         print(f"Ошибка отправки опроса: {e}")
 
@@ -606,6 +632,13 @@ async def poll_scheduler():
 
 async def main():
     print(f"Постоянный запуск бота {datetime.datetime.now(YEKB_TZ)}")
+    await bot.set_my_commands([
+        types.BotCommand(command="опрос", description="Создать опрос в общем чате"),
+        types.BotCommand(command="разделить", description="Разделить выбравших + на составы"),
+        types.BotCommand(command="статистика", description="Показать статистику"),
+        types.BotCommand(command="оплата", description="Рассчитать оплату"),
+        types.BotCommand(command="help", description="Список команд"),
+    ])
     scheduler = asyncio.create_task(poll_scheduler())
     try:
         await dp.start_polling(bot)
