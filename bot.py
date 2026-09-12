@@ -308,7 +308,7 @@ async def cmd_split_poll(message: types.Message):
     teams, _ = split_teams(players, team_count_for(len(players)))
     lines = ["⚖️ Предварительные составы"]
     for i, team in enumerate(teams, 1):
-        lines.append(f"\nКоманда {i} ({('белые', 'чёрные', 'красные')[i - 1]}):")
+        lines.append(f"\n{('⚪', '⚫', '🔴')[i - 1]} Команда {i} ({('белые', 'чёрные', 'красные')[i - 1]}):")
         lines.extend(f"• {name}" for name, _ in team)
     text = "\n".join(lines)
     state["draft"] = text
@@ -555,7 +555,7 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
     lines = [f"⚖️ Составы — {len(players)} игроков, {team_count} команды\n"]
     for i, team in enumerate(teams, 1):
         avg = sum(k for _, k in team) / len(team) if team else 0
-        lines.append(f"Команда {i} ({('белые', 'чёрные', 'красные')[i - 1]}) (средний коэф. {avg:.2f}):")
+        lines.append(f"{('⚪', '⚫', '🔴')[i - 1]} Команда {i} ({('белые', 'чёрные', 'красные')[i - 1]}) (средний коэф. {avg:.2f}):")
         lines += [f"• {n} — {k:.2f}" for n, k in team]
         lines.append("")
     if unknown:
