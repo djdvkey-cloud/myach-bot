@@ -18,7 +18,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ.get("OWNER_ID", "8378612979"))
-CHAT_ID = int(os.environ.get("CHAT_ID", "-1003857417996"))
+CHAT_ID = int(os.environ.get("CHAT_ID", "-5022330317"))
 
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 GAME_TIME = "21.30-23.00"
@@ -27,6 +27,7 @@ DATA_DIR = "data"
 STATS_FILE = os.path.join(DATA_DIR, "stats.json")
 OFFSET_FILE = os.path.join(DATA_DIR, "last_offset.txt")
 LAST_POLL_FILE = os.path.join(DATA_DIR, "last_poll.txt")
+POLL_STATE_FILE = os.path.join(DATA_DIR, "current_poll.json")
 
 # Очки
 GOAL_POINTS = 2.0
@@ -267,6 +268,8 @@ async def cmd_help(message: types.Message):
         "/матч Иванов 2+1, Петров 0+3, Соломин — записать игру\n"
         "/статистика — таблица\n"
         "/составы Иванов, Петров, ... — разбить на команды\n"
+        "/опрос — сразу опубликовать опрос в общем чате (владелец)\n"
+        "/разделить — разделить на команды всех, кто выбрал «+» (владелец)\n"
         "/отменить — убрать последнюю игру\n"
         "/оплата N — разделить сумму за игру на N человек\n"
         "/переименовать Старое = Новое\n"
@@ -423,6 +426,31 @@ async def cmd_reset(message: types.Message, command: CommandObject):
     await message.answer("Статистика очищена.")
 
 
+def format_lineups(names: list[str]) -> str:
+    """Формирует сбалансированные составы для списка имён."""
+    chat_players = load_stats().get(str(CHAT_ID), {}).get("players", {})
+    players = []
+    unknown = []
+    for name in names:
+        rec = chat_players.get(name)
+        koef = koef_of(rec) if rec and rec.get("games") else 0.0
+        if not rec or not rec.get("games"):
+            unknown.append(name)
+        players.append((name, koef))
+
+    team_count = team_count_for(len(players))
+    teams, _ = split_teams(players, team_count)
+    lines = [f"⚖️ Составы — {len(players)} игроков, {team_count} команды\n"]
+    for i, team in enumerate(teams, 1):
+        avg = sum(k for _, k in team) / len(team) if team else 0
+        lines.append(f"Команда {i} (средний коэф. {avg:.2f}):")
+        lines += [f"• {name} — {koef:.2f}" for name, koef in team]
+        lines.append("")
+    if unknown:
+        lines.append(f"Без статистики (коэф. 0): {', '.join(unknown)}")
+    return "\n".join(lines).strip()
+
+
 @dp.message(Command("составы"))
 async def cmd_lineups(message: types.Message, command: CommandObject):
     if not is_allowed(message, "составы"):
@@ -443,26 +471,94 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
     if not names:
         await message.answer(usage)
         return
-    chat_players = load_stats().get(str(target_chat(message)), {}).get("players", {})
-    players = []
-    unknown = []
-    for name in names:
-        rec = chat_players.get(name)
-        koef = koef_of(rec) if rec and rec.get("games") else 0.0
-        if not rec or not rec.get("games"):
-            unknown.append(name)
-        players.append((name, koef))
-    team_count = team_count_for(len(players))
-    teams, spread = split_teams(players, team_count)
-    lines = [f"⚖️ Составы — {len(players)} игроков, {team_count} команды\n"]
-    for i, team in enumerate(teams, 1):
-        avg = sum(k for _, k in team) / len(team) if team else 0
-        lines.append(f"Команда {i} (средний коэф. {avg:.2f}):")
-        lines += [f"• {n} — {k:.2f}" for n, k in team]
-        lines.append("")
-    if unknown:
-        lines.append(f"Без статистики (коэф. 0): {', '.join(unknown)}")
-    await message.answer("\n".join(lines).strip())
+    await message.answer(format_lineups(names))
+
+
+def poll_voter_name(answer: types.PollAnswer) -> tuple[str, str] | None:
+    """Возвращает устойчивый ID и отображаемое имя участника опроса."""
+    if answer.user:
+        user = answer.user
+        name = user.full_name or (f"@{user.username}" if user.username else str(user.id))
+        return str(user.id), name
+    if answer.voter_chat:
+        chat = answer.voter_chat
+        name = chat.title or chat.full_name or str(chat.id)
+        return f"chat:{chat.id}", name
+    return None
+
+
+async def send_game_poll() -> str:
+    """Публикует новый опрос и начинает собирать участников с ответом «+»."""
+    now = datetime.datetime.now(YEKB_TZ)
+    monday = now.date() + datetime.timedelta(days=(7 - now.weekday()) % 7 or 7)
+    if now.weekday() == 5:
+        monday = now.date() + datetime.timedelta(days=2)
+    question = f"Футбол Лестех понедельник {monday.strftime('%d.%m.%Y')} {GAME_TIME}"
+    sent = await bot.send_poll(
+        chat_id=CHAT_ID,
+        question=question,
+        options=["+", "-"],
+        is_anonymous=False,
+    )
+    save_json(POLL_STATE_FILE, {
+        "poll_id": sent.poll.id,
+        "message_id": sent.message_id,
+        "question": question,
+        "sent_at": now.isoformat(),
+        "plus_voters": {},
+    })
+    with open(LAST_POLL_FILE, "w") as f:
+        f.write(now.date().isoformat())
+    print(f"Опрос отправлен: {question}, poll_id={sent.poll.id}")
+    return question
+
+
+@dp.poll_answer()
+async def remember_poll_answer(answer: types.PollAnswer):
+    state = load_json(POLL_STATE_FILE, {})
+    if not state or state.get("poll_id") != answer.poll_id:
+        return
+    voter = poll_voter_name(answer)
+    if not voter:
+        return
+    voter_id, name = voter
+    plus_voters = state.setdefault("plus_voters", {})
+    if 0 in answer.option_ids:
+        plus_voters[voter_id] = name
+    else:
+        plus_voters.pop(voter_id, None)
+    save_json(POLL_STATE_FILE, state)
+    print(f"Ответ опроса сохранён: {name}, варианты={answer.option_ids}")
+
+
+@dp.message(Command("опрос"))
+async def cmd_poll(message: types.Message):
+    if not is_allowed(message, "опрос"):
+        return
+    try:
+        question = await send_game_poll()
+        if message.chat.id != CHAT_ID:
+            await message.answer(f"Опрос опубликован в общем чате:\n{question}")
+    except Exception as e:
+        print(f"Ошибка ручной отправки опроса: {e}")
+        await message.answer(f"Не удалось опубликовать опрос: {e}")
+
+
+@dp.message(Command("разделить"))
+async def cmd_split_poll(message: types.Message):
+    if not is_allowed(message, "разделить"):
+        return
+    state = load_json(POLL_STATE_FILE, {})
+    names = list(state.get("plus_voters", {}).values())
+    if len(names) < 2:
+        await message.answer(
+            f"Для деления нужно минимум 2 ответа «+». Сейчас отмечено: {len(names)}."
+        )
+        return
+    text = format_lineups(names)
+    await bot.send_message(chat_id=CHAT_ID, text=text)
+    if message.chat.id != CHAT_ID:
+        await message.answer(f"Составы опубликованы в общем чате: {len(names)} игроков.")
 
 
 async def maybe_send_poll():
@@ -481,21 +577,10 @@ async def maybe_send_poll():
             pass
     if last == today:
         return
-    monday = today + datetime.timedelta(days=2)
-    question = f"Футбол Лестех понедельник {monday.strftime('%d.%m.%Y')} {GAME_TIME}"
     try:
-        await bot.send_poll(
-            chat_id=CHAT_ID,
-            question=question,
-            options=["+", "-"],
-            is_anonymous=False,
-        )
-        with open(LAST_POLL_FILE, "w") as f:
-            f.write(today.isoformat())
-        print(f"Опрос отправлен: {question}")
+        await send_game_poll()
     except Exception as e:
         print(f"Ошибка отправки опроса: {e}")
-
 
 async def main():
     print(f"Запуск бота {datetime.datetime.now(YEKB_TZ)}")
