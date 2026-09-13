@@ -544,12 +544,16 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
         await message.answer(usage)
         return
     chat_players = load_stats().get(str(target_chat(message)), {}).get("players", {})
+    known_koefs = [koef_of(chat_players[n]) for n in names if n in chat_players and chat_players[n].get("games")]
+    fallback = sum(known_koefs) / len(known_koefs) if known_koefs else 1.0
     players = []
     unknown = []
     for name in names:
         rec = chat_players.get(name)
-        koef = koef_of(rec) if rec and rec.get("games") else 0.0
-        if not rec or not rec.get("games"):
+        if rec and rec.get("games"):
+            koef = koef_of(rec)
+        else:
+            koef = fallback
             unknown.append(name)
         players.append((name, koef))
     team_count = team_count_for(len(players))
@@ -561,7 +565,7 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
         lines += [f"• {n} — {k:.2f}" for n, k in team]
         lines.append("")
     if unknown:
-        lines.append(f"Без статистики (коэф. 0): {', '.join(unknown)}")
+        lines.append(f"Без статистики (коэф. {fallback:.2f} — среднее по остальным): {', '.join(unknown)}")
     await message.answer("\n".join(lines).strip())
 
 
