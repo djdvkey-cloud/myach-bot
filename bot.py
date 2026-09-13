@@ -288,7 +288,7 @@ async def cmd_add_guest(message: types.Message, command: CommandObject):
     await message.answer("Добавлены: " + ", ".join(g["name"] for g in guests))
 
 
-@dp.message(Command("разделить"))
+@dp.message(Command("разделить", "split"))
 async def cmd_split_poll(message: types.Message):
     if message.from_user.id != OWNER_ID or message.chat.type != "private":
         return
@@ -351,7 +351,7 @@ async def cmd_start(message: types.Message):
         return
     await message.answer(
         f"Привет, {message.from_user.first_name}!\n"
-        "Я бот «Мяч» (версия для GitHub Actions).\n"
+        "Я бот «Мяч».\n"
         "Команда /help — список команд."
     )
 
@@ -365,6 +365,8 @@ async def cmd_help(message: types.Message):
         "/матч Иванов 2+1, Петров 0+3, Соломин — записать игру\n"
         "/статистика — таблица\n"
         "/составы Иванов, Петров, ... — разбить на команды\n"
+        "/опрос — вручную опубликовать опрос на понедельник (на случай сбоя автоматики)\n"
+        "/разделить — разбить проголосовавших «+» на команды\n"
         "/отменить — убрать последнюю игру\n"
         "/оплата N — разделить сумму за игру на N человек\n"
         "/переименовать Старое = Новое\n"
@@ -418,7 +420,7 @@ async def cmd_match(message: types.Message, command: CommandObject):
     await message.answer("\n".join(lines))
 
 
-@dp.message(Command("оплата"))
+@dp.message(Command("оплата", "pay"))
 async def cmd_payment(message: types.Message, command: CommandObject):
     if not is_allowed(message, "оплата"):
         return
@@ -437,7 +439,7 @@ async def cmd_payment(message: types.Message, command: CommandObject):
     )
 
 
-@dp.message(Command("статистика"))
+@dp.message(Command("статистика", "stats"))
 async def cmd_stats(message: types.Message):
     if not is_allowed(message, "статистика"):
         return
@@ -589,7 +591,7 @@ async def create_game_poll(chat_id: int):
     return question
 
 
-@dp.message(Command("опрос"))
+@dp.message(Command("опрос", "poll"))
 async def cmd_poll(message: types.Message):
     if not message.from_user or message.from_user.id != OWNER_ID:
         return
