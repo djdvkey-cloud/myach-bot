@@ -633,10 +633,10 @@ async def poll_scheduler():
 async def main():
     print(f"Постоянный запуск бота {datetime.datetime.now(YEKB_TZ)}")
     await bot.set_my_commands([
-        types.BotCommand(command="опрос", description="Создать опрос в общем чате"),
-        types.BotCommand(command="разделить", description="Разделить выбравших + на составы"),
-        types.BotCommand(command="статистика", description="Показать статистику"),
-        types.BotCommand(command="оплата", description="Рассчитать оплату"),
+        types.BotCommand(command="poll", description="Создать опрос в общем чате"),
+        types.BotCommand(command="split", description="Разделить выбравших + на составы"),
+        types.BotCommand(command="stats", description="Показать статистику"),
+        types.BotCommand(command="pay", description="Рассчитать оплату"),
         types.BotCommand(command="help", description="Список команд"),
     ])
     scheduler = asyncio.create_task(poll_scheduler())
