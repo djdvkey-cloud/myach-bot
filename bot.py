@@ -18,7 +18,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ.get("OWNER_ID", "8378612979"))
-CHAT_ID = int(os.environ.get("CHAT_ID", "-1003857417996"))
+CHAT_ID = int(os.environ.get("CHAT_ID", "-5022330317"))
 
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 GAME_TIME = "21.30-23.00"
