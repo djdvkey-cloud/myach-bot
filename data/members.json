@@ -1,0 +1,32 @@
+{
+  "_purpose": "Сопоставление игроков (имена, как в data/stats.json или в чате) с их Telegram username — нужно для идентификации проголосовавших в еженедельном опросе. Собрано вручную владельцем из чата, будет пополняться.",
+  "_last_updated": "2026-09-15",
+  "members": [
+    {"name": "Ларионов М.", "username": "lmur2000"},
+    {"name": "Бобров М.", "username": "BobrovMA1996"},
+    {"name": "Серганов А.", "username": "aserganov"},
+    {"name": "Голыжбин Е.", "username": "Evgen0090"},
+    {"name": "Ковалев М.", "username": "AkunaMatata555"},
+    {"name": "Баталов Е.", "username": "BatlDad"},
+    {"name": "Матвеев А.", "username": "matveev_andrei"},
+    {"name": "Бессмертных С.", "username": "getmorepower"},
+    {"name": "Мирасов Г.", "username": "girfanmir"},
+    {"name": "Лучинин А.", "username": "LuchininAleksandr"},
+    {"name": "Вахобов Г.", "username": "INVESTORGULOM"},
+    {"name": "Влад", "username": "VladislavOAR"},
+    {"name": "Антон", "username": "Simma445"},
+    {"name": "IIvajan", "username": "IvaJan"},
+    {"name": "D", "username": "dadadaann"},
+    {"name": "Alexandr", "username": "Footmor"},
+    {"name": "Сикач И.", "username": "tWoKizaa"},
+    {"name": "Моргун А.", "username": "Cptmorgun"},
+    {"name": "Калабин Д.", "username": "dv_kalabin"},
+    {"name": "Волков М.", "username": null, "note": "username неизвестен, в чате отображается как «Михаил»"},
+    {"name": "Большаков В.", "username": "v0000000000000001"},
+    {"name": "Расчетов А.", "username": null, "note": "username неизвестен, в чате отображается как «Q»"},
+    {"name": "Мякушко З.", "username": null, "note": "username неизвестен, в чате отображается как «Zakhar Miakushko»"},
+    {"name": "Чичин А.", "username": "temachichin"},
+    {"name": "igorb", "username": null, "note": "неизвестен — возможно это и есть отображаемое имя в чате, а не username"},
+    {"name": "Жора Фельбуш", "username": null, "note": "username неизвестен"}
+  ]
+}
