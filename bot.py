@@ -1,5 +1,5 @@
 """
-Футбольный бот «Мяч» — версия для GitHub Actions
+Футбольный бот «Мяч» — постоянная версия для Amvera
 Опросы по субботам + команды статистики и составов
 """
 import asyncio
@@ -18,16 +18,32 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ.get("OWNER_ID", "8378612979"))
-CHAT_ID = int(os.environ.get("CHAT_ID", "-5022330317"))
+CHAT_ID = int(os.environ.get("CHAT_ID", "-1003857417996"))
 
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 GAME_TIME = "21.30-23.00"
 
-DATA_DIR = "data"
+DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else "data")
 STATS_FILE = os.path.join(DATA_DIR, "stats.json")
 OFFSET_FILE = os.path.join(DATA_DIR, "last_offset.txt")
 LAST_POLL_FILE = os.path.join(DATA_DIR, "last_poll.txt")
-POLL_STATE_FILE = os.path.join(DATA_DIR, "current_poll.json")
+POLL_STATE_FILE = os.path.join(DATA_DIR, "poll_state.json")
+GUESTS_FILE = os.path.join(DATA_DIR, "guests.json")
+
+PLAYER_USERNAMES = {
+    "Ларионов М.": "lmur2000", "Бобров М.": "BobrovMA1996",
+    "Серганов А.": "aserganov", "Голыжбин Е.": "Evgen0090",
+    "Ковалев М.": "AkunaMatata555", "Баталов Е.": "BatlDad",
+    "Матвеев А.": "matveev_andrei", "Бессмертных С.": "getmorepower",
+    "Мирасов Г.": "girfanmir", "Лучинин А.": "LuchininAleksandr",
+    "Вахобов Г.": "INVESTORGULOM", "Влад": "VladislavOAR",
+    "Антон": "Simma445", "IIvajan": "IvaJan", "D": "dadadaann",
+    "Alexandr": "Footmor", "Сикач И.": "tWoKizaa",
+    "Моргун А.": "Cptmorgun", "Калабин Д.": "dv_kalabin",
+    "Чичин А.": "temachichin",
+}
+DISPLAY_ALIASES = {"михаил": "Волков М.", "вадим": "Большаков В.",
+                   "q": "Расчётов А.", "zakhar miakushko": "Мякушко З."}
 
 # Очки
 GOAL_POINTS = 2.0
@@ -127,7 +143,6 @@ def parse_match_line(text: str):
 
 EXACT_LIMIT = 15  # до 15 игроков — точный перебор, дальше — эвристика
                   # (перебор от 16 игроков уже занимает больше 5 секунд)
-
 
 def team_count_for(n: int) -> int:
     """2 команды, если играющих меньше 15, иначе 3."""
@@ -231,9 +246,92 @@ def split_teams(players: list, team_count: int):
     return heuristic_split(players, team_count)
 
 
+def player_name_for(user: types.User) -> str | None:
+    username = (user.username or "").lower()
+    for name, saved_username in PLAYER_USERNAMES.items():
+        if username and username == saved_username.lower():
+            return name
+    display = " ".join(x for x in (user.first_name, user.last_name) if x).strip().lower()
+    return DISPLAY_ALIASES.get(display)
+
+
+@dp.poll_answer()
+async def poll_answer(answer: types.PollAnswer):
+    state = load_json(POLL_STATE_FILE, {})
+    if answer.poll_id != state.get("poll_id"):
+        return
+    voters = state.setdefault("voters", {})
+    key = str(answer.user.id)
+    if 0 in answer.option_ids:
+        voters[key] = {
+            "username": answer.user.username or "",
+            "display": " ".join(x for x in (answer.user.first_name, answer.user.last_name) if x),
+            "player": player_name_for(answer.user),
+        }
+    else:
+        voters.pop(key, None)
+    save_json(POLL_STATE_FILE, state)
+
+
+@dp.message(Command("добавить"))
+async def cmd_add_guest(message: types.Message, command: CommandObject):
+    if message.from_user.id != OWNER_ID or message.chat.type != "private":
+        return
+    if not command.args:
+        return await message.answer("Формат: /добавить Алексей, Максим 2.3")
+    guests = load_json(GUESTS_FILE, [])
+    for part in command.args.split(","):
+        part = part.strip()
+        m = re.match(r"^(.+?)(?:\s+(\d+(?:[.,]\d+)?))?$", part)
+        if m:
+            guests.append({"name": m.group(1).strip(), "rating": float(m.group(2).replace(",", ".")) if m.group(2) else None})
+    save_json(GUESTS_FILE, guests)
+    await message.answer("Добавлены: " + ", ".join(g["name"] for g in guests))
+
+
+@dp.message(Command("разделить", "split"))
+async def cmd_split_poll(message: types.Message):
+    if message.from_user.id != OWNER_ID or message.chat.type != "private":
+        return
+    state = load_json(POLL_STATE_FILE, {})
+    voters = list(state.get("voters", {}).values())
+    unresolved = [v["display"] or ("@" + v["username"]) for v in voters if not v.get("player")]
+    if unresolved:
+        return await message.answer("Сначала нужно привязать: " + ", ".join(unresolved))
+    names = [v["player"] for v in voters] + [g["name"] for g in load_json(GUESTS_FILE, [])]
+    if len(names) < 2:
+        return await message.answer("Для деления нужно минимум два игрока.")
+    stats = load_stats().get(str(CHAT_ID), {}).get("players", {})
+    known = [koef_of(stats[n]) for n in names if n in stats and stats[n].get("games")]
+    fallback = sum(known) / len(known) if known else 1.0
+    guest_ratings = {g["name"]: g.get("rating") for g in load_json(GUESTS_FILE, [])}
+    players = [(n, koef_of(stats[n]) if n in stats and stats[n].get("games") else (guest_ratings.get(n) or fallback)) for n in names]
+    teams, _ = split_teams(players, team_count_for(len(players)))
+    lines = ["⚖️ Предварительные составы"]
+    for i, team in enumerate(teams, 1):
+        lines.append(f"\n{('⚪', '⚫', '🔴')[i - 1]} Команда {i} ({('белые', 'чёрные', 'красные')[i - 1]}):")
+        lines.extend(f"• {name}" for name, _ in team)
+    text = "\n".join(lines)
+    state["draft"] = text
+    save_json(POLL_STATE_FILE, state)
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[[types.InlineKeyboardButton(text="Опубликовать в общий чат", callback_data="publish_lineups")]])
+    await message.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(lambda q: q.data == "publish_lineups")
+async def publish_lineups(query: types.CallbackQuery):
+    if query.from_user.id != OWNER_ID:
+        return await query.answer("Недоступно", show_alert=True)
+    state = load_json(POLL_STATE_FILE, {})
+    if state.get("draft"):
+        await bot.send_message(CHAT_ID, state["draft"])
+        save_json(GUESTS_FILE, [])
+    await query.answer("Опубликовано")
+
+
 # Команды, доступные любому участнику чата — то, чем пользуются каждую игру.
 # «Переименовать» и «обнулить» — только владельцу, это не игровые действия.
-OPEN_COMMANDS = {"матч", "статистика", "составы", "отменить", "оплата", "опрос", "start", "help", "id"}
+OPEN_COMMANDS = {"матч", "статистика", "составы", "отменить", "оплата", "start", "help", "id"}
 
 
 def is_allowed(message: types.Message, command: str = "") -> bool:
@@ -254,7 +352,7 @@ async def cmd_start(message: types.Message):
         return
     await message.answer(
         f"Привет, {message.from_user.first_name}!\n"
-        "Я бот «Мяч» (версия для GitHub Actions).\n"
+        "Я бот «Мяч».\n"
         "Команда /help — список команд."
     )
 
@@ -268,12 +366,11 @@ async def cmd_help(message: types.Message):
         "/матч Иванов 2+1, Петров 0+3, Соломин — записать игру\n"
         "/статистика — таблица\n"
         "/составы Иванов, Петров, ... — разбить на команды\n"
-        "/опрос — сразу опубликовать опрос в общем чате\n"
-        "/разделить — разделить на команды всех, кто выбрал «+» (владелец)\n"
+        "/опрос — сразу опубликовать опрос на понедельник (на случай сбоя автоматики)\n"
+        "/разделить — разбить проголосовавших «+» на команды\n"
         "/отменить — убрать последнюю игру\n"
-        "/оплата N — разделить сумму за игру на N человек\n"
         "/переименовать Старое = Новое\n"
-        "/обнулить да — стереть статистику\n"
+        "/обнулить — стереть статистику\n"
         "/id — узнать ID\n\n"
         "Опрос публикуется автоматически каждую субботу в 12:00."
     )
@@ -426,31 +523,6 @@ async def cmd_reset(message: types.Message, command: CommandObject):
     await message.answer("Статистика очищена.")
 
 
-def format_lineups(names: list[str]) -> str:
-    """Формирует сбалансированные составы для списка имён."""
-    chat_players = load_stats().get(str(CHAT_ID), {}).get("players", {})
-    players = []
-    unknown = []
-    for name in names:
-        rec = chat_players.get(name)
-        koef = koef_of(rec) if rec and rec.get("games") else 0.0
-        if not rec or not rec.get("games"):
-            unknown.append(name)
-        players.append((name, koef))
-
-    team_count = team_count_for(len(players))
-    teams, _ = split_teams(players, team_count)
-    lines = [f"⚖️ Составы — {len(players)} игроков, {team_count} команды\n"]
-    for i, team in enumerate(teams, 1):
-        avg = sum(k for _, k in team) / len(team) if team else 0
-        lines.append(f"Команда {i} (средний коэф. {avg:.2f}):")
-        lines += [f"• {name} — {koef:.2f}" for name, koef in team]
-        lines.append("")
-    if unknown:
-        lines.append(f"Без статистики (коэф. 0): {', '.join(unknown)}")
-    return "\n".join(lines).strip()
-
-
 @dp.message(Command("составы"))
 async def cmd_lineups(message: types.Message, command: CommandObject):
     if not is_allowed(message, "составы"):
@@ -471,101 +543,76 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
     if not names:
         await message.answer(usage)
         return
-    await message.answer(format_lineups(names))
+    chat_players = load_stats().get(str(target_chat(message)), {}).get("players", {})
+    known_koefs = [koef_of(chat_players[n]) for n in names if n in chat_players and chat_players[n].get("games")]
+    fallback = sum(known_koefs) / len(known_koefs) if known_koefs else 1.0
+    players = []
+    unknown = []
+    for name in names:
+        rec = chat_players.get(name)
+        if rec and rec.get("games"):
+            koef = koef_of(rec)
+        else:
+            koef = fallback
+            unknown.append(name)
+        players.append((name, koef))
+    team_count = team_count_for(len(players))
+    teams, spread = split_teams(players, team_count)
+    lines = [f"⚖️ Составы — {len(players)} игроков, {team_count} команды\n"]
+    for i, team in enumerate(teams, 1):
+        avg = sum(k for _, k in team) / len(team) if team else 0
+        lines.append(f"{('⚪', '⚫', '🔴')[i - 1]} Команда {i} ({('белые', 'чёрные', 'красные')[i - 1]}) (средний коэф. {avg:.2f}):")
+        lines += [f"• {n} — {k:.2f}" for n, k in team]
+        lines.append("")
+    if unknown:
+        lines.append(f"Без статистики (коэф. {fallback:.2f} — среднее по остальным): {', '.join(unknown)}")
+    await message.answer("\n".join(lines).strip())
 
 
-def poll_voter_name(answer: types.PollAnswer) -> tuple[str, str] | None:
-    """Возвращает устойчивый ID и отображаемое имя участника опроса."""
-    if answer.user:
-        user = answer.user
-        name = user.full_name or (f"@{user.username}" if user.username else str(user.id))
-        return str(user.id), name
-    if answer.voter_chat:
-        chat = answer.voter_chat
-        name = chat.title or chat.full_name or str(chat.id)
-        return f"chat:{chat.id}", name
-    return None
-
-
-async def send_game_poll() -> str:
-    """Публикует новый опрос и начинает собирать участников с ответом «+»."""
+async def create_game_poll(chat_id: int):
     now = datetime.datetime.now(YEKB_TZ)
-    monday = now.date() + datetime.timedelta(days=(7 - now.weekday()) % 7 or 7)
-    if now.weekday() == 5:
-        monday = now.date() + datetime.timedelta(days=2)
+    today = now.date()
+    days_until_monday = (7 - today.weekday()) % 7
+    if days_until_monday == 0:
+        days_until_monday = 7
+    monday = today + datetime.timedelta(days=days_until_monday)
     question = f"Футбол Лестех понедельник {monday.strftime('%d.%m.%Y')} {GAME_TIME}"
-    sent = await bot.send_poll(
-        chat_id=CHAT_ID,
+    poll_message = await bot.send_poll(
+        chat_id=chat_id,
         question=question,
         options=["+", "-"],
         is_anonymous=False,
     )
-    save_json(POLL_STATE_FILE, {
-        "poll_id": sent.poll.id,
-        "message_id": sent.message_id,
-        "question": question,
-        "sent_at": now.isoformat(),
-        "plus_voters": {},
-    })
     with open(LAST_POLL_FILE, "w") as f:
-        f.write(now.date().isoformat())
-    print(f"Опрос отправлен: {question}, poll_id={sent.poll.id}")
+        f.write(today.isoformat())
+    save_json(POLL_STATE_FILE, {
+        "poll_id": poll_message.poll.id,
+        "message_id": poll_message.message_id,
+        "date": today.isoformat(),
+        "voters": {},
+    })
+    print(f"Опрос отправлен: {question}")
     return question
 
 
-@dp.poll_answer()
-async def remember_poll_answer(answer: types.PollAnswer):
-    state = load_json(POLL_STATE_FILE, {})
-    if not state or state.get("poll_id") != answer.poll_id:
-        return
-    voter = poll_voter_name(answer)
-    if not voter:
-        return
-    voter_id, name = voter
-    plus_voters = state.setdefault("plus_voters", {})
-    if 0 in answer.option_ids:
-        plus_voters[voter_id] = name
-    else:
-        plus_voters.pop(voter_id, None)
-    save_json(POLL_STATE_FILE, state)
-    print(f"Ответ опроса сохранён: {name}, варианты={answer.option_ids}")
-
-
-@dp.message(Command("опрос"))
+@dp.message(Command("опрос", "poll"))
 async def cmd_poll(message: types.Message):
-    if not is_allowed(message, "опрос"):
+    if not message.from_user or message.from_user.id != OWNER_ID:
         return
     try:
-        question = await send_game_poll()
+        question = await create_game_poll(CHAT_ID)
         if message.chat.id != CHAT_ID:
-            await message.answer(f"Опрос опубликован в общем чате:\n{question}")
+            await message.answer(f"Опрос отправлен в общий чат: {question}")
     except Exception as e:
-        print(f"Ошибка ручной отправки опроса: {e}")
-        await message.answer(f"Не удалось опубликовать опрос: {e}")
-
-
-@dp.message(Command("разделить"))
-async def cmd_split_poll(message: types.Message):
-    if not is_allowed(message, "разделить"):
-        return
-    state = load_json(POLL_STATE_FILE, {})
-    names = list(state.get("plus_voters", {}).values())
-    if len(names) < 2:
-        await message.answer(
-            f"Для деления нужно минимум 2 ответа «+». Сейчас отмечено: {len(names)}."
-        )
-        return
-    text = format_lineups(names)
-    await bot.send_message(chat_id=CHAT_ID, text=text)
-    if message.chat.id != CHAT_ID:
-        await message.answer(f"Составы опубликованы в общем чате: {len(names)} игроков.")
+        await message.answer(f"Не удалось отправить опрос: {e}")
 
 
 async def maybe_send_poll():
     now = datetime.datetime.now(YEKB_TZ)
     if now.weekday() != 5:  # суббота
         return
-    if not (11 <= now.hour <= 13):
+    # При перезапуске в течение часа всё равно отправим опрос, но не раньше 12:00.
+    if now.hour != 12:
         return
     today = now.date()
     last = None
@@ -578,33 +625,31 @@ async def maybe_send_poll():
     if last == today:
         return
     try:
-        await send_game_poll()
+        await create_game_poll(CHAT_ID)
     except Exception as e:
         print(f"Ошибка отправки опроса: {e}")
 
-async def main():
-    print(f"Запуск бота {datetime.datetime.now(YEKB_TZ)}")
-    try:
+
+async def poll_scheduler():
+    while True:
         await maybe_send_poll()
-        offset = load_offset()
-        try:
-            updates = await bot.get_updates(offset=offset, timeout=20, limit=50)
-        except Exception as e:
-            print(f"Ошибка getUpdates: {e}")
-            return
-        if not updates:
-            print("Новых сообщений нет")
-            return
-        max_id = offset
-        for update in updates:
-            max_id = max(max_id, update.update_id + 1)
-            try:
-                await dp.feed_update(bot, update)
-            except Exception as e:
-                print(f"Ошибка обработки update {update.update_id}: {e}")
-        save_offset(max_id)
-        print(f"Обработано обновлений: {len(updates)}, новый offset: {max_id}")
+        await asyncio.sleep(60)
+
+
+async def main():
+    print(f"Постоянный запуск бота {datetime.datetime.now(YEKB_TZ)}")
+    await bot.set_my_commands([
+        types.BotCommand(command="poll", description="Создать опрос в общем чате"),
+        types.BotCommand(command="split", description="Разделить выбравших + на составы"),
+        types.BotCommand(command="stats", description="Показать статистику"),
+        types.BotCommand(command="pay", description="Рассчитать оплату"),
+        types.BotCommand(command="help", description="Список команд"),
+    ])
+    scheduler = asyncio.create_task(poll_scheduler())
+    try:
+        await dp.start_polling(bot)
     finally:
+        scheduler.cancel()
         await bot.session.close()
 
 
