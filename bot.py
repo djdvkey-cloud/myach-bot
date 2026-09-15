@@ -40,6 +40,7 @@ PLAYER_USERNAMES = {
     "Антон": "Simma445", "IIvajan": "IvaJan", "D": "dadadaann",
     "Alexandr": "Footmor", "Сикач И.": "tWoKizaa",
     "Моргун А.": "Cptmorgun", "Калабин Д.": "dv_kalabin",
+    "Чичин А.": "temachichin",
 }
 DISPLAY_ALIASES = {"михаил": "Волков М.", "вадим": "Большаков В.",
                    "q": "Расчётов А.", "zakhar miakushko": "Мякушко З."}
@@ -365,12 +366,11 @@ async def cmd_help(message: types.Message):
         "/матч Иванов 2+1, Петров 0+3, Соломин — записать игру\n"
         "/статистика — таблица\n"
         "/составы Иванов, Петров, ... — разбить на команды\n"
-        "/опрос — вручную опубликовать опрос на понедельник (на случай сбоя автоматики)\n"
+        "/опрос — сразу опубликовать опрос на понедельник (на случай сбоя автоматики)\n"
         "/разделить — разбить проголосовавших «+» на команды\n"
         "/отменить — убрать последнюю игру\n"
-        "/оплата N — разделить сумму за игру на N человек\n"
         "/переименовать Старое = Новое\n"
-        "/обнулить да — стереть статистику\n"
+        "/обнулить — стереть статистику\n"
         "/id — узнать ID\n\n"
         "Опрос публикуется автоматически каждую субботу в 12:00."
     )
@@ -420,7 +420,7 @@ async def cmd_match(message: types.Message, command: CommandObject):
     await message.answer("\n".join(lines))
 
 
-@dp.message(Command("оплата", "pay"))
+@dp.message(Command("оплата"))
 async def cmd_payment(message: types.Message, command: CommandObject):
     if not is_allowed(message, "оплата"):
         return
@@ -439,7 +439,7 @@ async def cmd_payment(message: types.Message, command: CommandObject):
     )
 
 
-@dp.message(Command("статистика", "stats"))
+@dp.message(Command("статистика"))
 async def cmd_stats(message: types.Message):
     if not is_allowed(message, "статистика"):
         return
