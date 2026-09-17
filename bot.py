@@ -420,23 +420,55 @@ async def cmd_match(message: types.Message, command: CommandObject):
     await message.answer("\n".join(lines))
 
 
+def format_payment(n: int) -> str:
+    per_player = calc_payment_per_player(GAME_TOTAL_RUB, n)
+    return (
+        f"Переводим по {per_player} рублей по номеру телефона "
+        f"{PAYMENT_PHONE}. Только {PAYMENT_BANK}."
+    )
+
+
+# Число игроков нажатием кнопки — команда из меню Telegram (/pay) всегда
+# улетает в чат сразу, БЕЗ аргумента: дописать к ней число с кнопки
+# невозможно, это ограничение самого Telegram, не бага бота. Раньше в
+# таком случае бот просто просил ввести число текстом — с кнопки это
+# было тупиком. Теперь вместо этого показываем готовые варианты.
+PAYMENT_QUICK_COUNTS = [12, 13, 14, 15, 16, 17, 18]
+
+
 @dp.message(Command("оплата", "pay"))
 async def cmd_payment(message: types.Message, command: CommandObject):
     if not is_allowed(message, "оплата"):
         return
     args = (command.args or "").strip()
     if not args.isdigit() or int(args) <= 0:
-        await message.answer("Формат: /оплата N — где N число игравших сегодня, например /оплата 14")
+        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[[
+            types.InlineKeyboardButton(text=str(n), callback_data=f"pay:{n}")
+            for n in PAYMENT_QUICK_COUNTS
+        ]])
+        await message.answer(
+            "Сколько сегодня играло? Нажмите число ниже "
+            "или напишите вручную: /оплата N",
+            reply_markup=keyboard,
+        )
         return
     n = int(args)
     if n > 30:
         await message.answer(f"Многовато — {n} человек? Проверьте число.")
         return
-    per_player = calc_payment_per_player(GAME_TOTAL_RUB, n)
-    await message.answer(
-        f"Переводим по {per_player} рублей по номеру телефона "
-        f"{PAYMENT_PHONE}. Только {PAYMENT_BANK}."
+    await message.answer(format_payment(n))
+
+
+@dp.callback_query(lambda q: q.data and q.data.startswith("pay:"))
+async def cmd_payment_callback(query: types.CallbackQuery):
+    allowed = query.from_user.id == OWNER_ID or (
+        query.message and query.message.chat.id == CHAT_ID
     )
+    if not allowed:
+        return await query.answer("Недоступно", show_alert=True)
+    n = int(query.data.split(":", 1)[1])
+    await query.message.answer(format_payment(n))
+    await query.answer()
 
 
 @dp.message(Command("статистика", "stats"))
