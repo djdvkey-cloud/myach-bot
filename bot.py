@@ -420,7 +420,7 @@ async def cmd_match(message: types.Message, command: CommandObject):
     await message.answer("\n".join(lines))
 
 
-@dp.message(Command("оплата"))
+@dp.message(Command("оплата", "pay"))
 async def cmd_payment(message: types.Message, command: CommandObject):
     if not is_allowed(message, "оплата"):
         return
@@ -439,7 +439,7 @@ async def cmd_payment(message: types.Message, command: CommandObject):
     )
 
 
-@dp.message(Command("статистика"))
+@dp.message(Command("статистика", "stats"))
 async def cmd_stats(message: types.Message):
     if not is_allowed(message, "статистика"):
         return
@@ -631,8 +631,22 @@ async def maybe_send_poll():
 
 
 async def poll_scheduler():
+    """Раз в минуту проверяет, не пора ли отправить опрос.
+
+    17.09.2026: процесс формально не падал (событий рестарта не было),
+    но кнопки меню не отвечали почти сутки — а в логах за это время не
+    было ни строчки, потому что бот и так почти ничего не печатает.
+    Понять по логам, жив ли цикл, было невозможно. Теперь раз в
+    ~30 минут пишем простое "сердцебиение" — не чинит зависание само по
+    себе, но хотя бы видно в getRunLogs, что цикл ещё тикает, не
+    дожидаясь, пока кто-то заметит неотвечающие кнопки."""
+    tick = 0
+    print(f"[DEBUG] планировщик опроса запущен {datetime.datetime.now(YEKB_TZ):%d.%m.%Y %H:%M}")
     while True:
         await maybe_send_poll()
+        tick += 1
+        if tick % 30 == 0:
+            print(f"[DEBUG] планировщик жив, тик {tick}, {datetime.datetime.now(YEKB_TZ):%d.%m.%Y %H:%M}")
         await asyncio.sleep(60)
 
 
