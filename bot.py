@@ -307,10 +307,11 @@ async def cmd_split_poll(message: types.Message):
     guest_ratings = {g["name"]: g.get("rating") for g in load_json(GUESTS_FILE, [])}
     players = [(n, koef_of(stats[n]) if n in stats and stats[n].get("games") else (guest_ratings.get(n) or fallback)) for n in names]
     teams, _ = split_teams(players, team_count_for(len(players)))
-    lines = ["⚖️ Предварительные составы"]
+    lines = ["⚖️ Предварительные составы (для сверки со статистикой перед публикацией)"]
     for i, team in enumerate(teams, 1):
-        lines.append(f"\n{('⚪', '⚫', '🔴')[i - 1]} Команда {i} ({('белые', 'чёрные', 'красные')[i - 1]}):")
-        lines.extend(f"• {name}" for name, _ in team)
+        avg = sum(koef for _, koef in team) / len(team) if team else 0.0
+        lines.append(f"\n{('⚪', '⚫', '🔴')[i - 1]} Команда {i} ({('белые', 'чёрные', 'красные')[i - 1]}) — ср. коэф. {avg:.2f}:")
+        lines.extend(f"• {name} — {koef:.2f}" for name, koef in team)
     text = "\n".join(lines)
     state["draft"] = text
     state["draft_teams"] = [[[name, koef] for name, koef in team] for team in teams]
@@ -320,9 +321,8 @@ async def cmd_split_poll(message: types.Message):
 
 
 def format_public_lineups(teams: list) -> str:
-    """Красивое сообщение для общего чата: количество игроков, средний
-    коэффициент команды и коэффициент каждого игрока — в отличие от
-    приватного черновика, где для быстрой проверки достаточно имён."""
+    """Сообщение для общего чата: общее число игроков плюс то же самое
+    по коэффициентам, что и в приватном черновике."""
     icons = ("⚪", "⚫", "🔴")
     labels = ("белые", "чёрные", "красные")
     total = sum(len(team) for team in teams)
