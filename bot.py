@@ -313,9 +313,25 @@ async def cmd_split_poll(message: types.Message):
         lines.extend(f"• {name}" for name, _ in team)
     text = "\n".join(lines)
     state["draft"] = text
+    state["draft_teams"] = [[[name, koef] for name, koef in team] for team in teams]
     save_json(POLL_STATE_FILE, state)
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[[types.InlineKeyboardButton(text="Опубликовать в общий чат", callback_data="publish_lineups")]])
     await message.answer(text, reply_markup=keyboard)
+
+
+def format_public_lineups(teams: list) -> str:
+    """Красивое сообщение для общего чата: количество игроков, средний
+    коэффициент команды и коэффициент каждого игрока — в отличие от
+    приватного черновика, где для быстрой проверки достаточно имён."""
+    icons = ("⚪", "⚫", "🔴")
+    labels = ("белые", "чёрные", "красные")
+    total = sum(len(team) for team in teams)
+    lines = [f"⚽ Составы на игру — {total} чел."]
+    for i, team in enumerate(teams):
+        avg = sum(koef for _, koef in team) / len(team) if team else 0.0
+        lines.append(f"\n{icons[i]} Команда {i + 1} ({labels[i]}) — ср. коэф. {avg:.2f}")
+        lines.extend(f"• {name} — {koef:.2f}" for name, koef in team)
+    return "\n".join(lines)
 
 
 @dp.callback_query(lambda q: q.data == "publish_lineups")
@@ -323,7 +339,11 @@ async def publish_lineups(query: types.CallbackQuery):
     if query.from_user.id != OWNER_ID:
         return await query.answer("Недоступно", show_alert=True)
     state = load_json(POLL_STATE_FILE, {})
-    if state.get("draft"):
+    if state.get("draft_teams"):
+        text = format_public_lineups(state["draft_teams"])
+        await bot.send_message(CHAT_ID, text)
+        save_json(GUESTS_FILE, [])
+    elif state.get("draft"):
         await bot.send_message(CHAT_ID, state["draft"])
         save_json(GUESTS_FILE, [])
     await query.answer("Опубликовано")
