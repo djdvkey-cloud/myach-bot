@@ -305,33 +305,42 @@ async def cmd_split_poll(message: types.Message):
     known = [koef_of(stats[n]) for n in names if n in stats and stats[n].get("games")]
     fallback = sum(known) / len(known) if known else 1.0
     guest_ratings = {g["name"]: g.get("rating") for g in load_json(GUESTS_FILE, [])}
-    players = [(n, koef_of(stats[n]) if n in stats and stats[n].get("games") else (guest_ratings.get(n) or fallback)) for n in names]
+    players = []
+    unknown = []
+    for n in names:
+        rec = stats.get(n)
+        if rec and rec.get("games"):
+            koef = koef_of(rec)
+        elif guest_ratings.get(n):
+            koef = guest_ratings[n]
+        else:
+            koef = fallback
+            unknown.append(n)
+        players.append((n, koef))
     teams, _ = split_teams(players, team_count_for(len(players)))
-    lines = ["⚖️ Предварительные составы (для сверки со статистикой перед публикацией)"]
-    for i, team in enumerate(teams, 1):
-        avg = sum(koef for _, koef in team) / len(team) if team else 0.0
-        lines.append(f"\n{('⚪', '⚫', '🔴')[i - 1]} Команда {i} ({('белые', 'чёрные', 'красные')[i - 1]}) — ср. коэф. {avg:.2f}:")
-        lines.extend(f"• {name} — {koef:.2f}" for name, koef in team)
-    text = "\n".join(lines)
+    text = format_lineups(teams, unknown, fallback)
     state["draft"] = text
     state["draft_teams"] = [[[name, koef] for name, koef in team] for team in teams]
+    state["unknown"] = unknown
+    state["fallback"] = fallback
     save_json(POLL_STATE_FILE, state)
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[[types.InlineKeyboardButton(text="Опубликовать в общий чат", callback_data="publish_lineups")]])
     await message.answer(text, reply_markup=keyboard)
 
 
-def format_public_lineups(teams: list) -> str:
-    """Сообщение для общего чата: общее число игроков плюс то же самое
-    по коэффициентам, что и в приватном черновике."""
-    icons = ("⚪", "⚫", "🔴")
-    labels = ("белые", "чёрные", "красные")
+def format_lineups(teams: list, unknown: list, fallback: float) -> str:
+    """Общий формат для /составы и /разделить, чтобы черновик в личке,
+    публикация в общий чат и ручной ввод выглядели одинаково."""
     total = sum(len(team) for team in teams)
-    lines = [f"⚽ Составы на игру — {total} чел."]
-    for i, team in enumerate(teams):
-        avg = sum(koef for _, koef in team) / len(team) if team else 0.0
-        lines.append(f"\n{icons[i]} Команда {i + 1} ({labels[i]}) — ср. коэф. {avg:.2f}")
-        lines.extend(f"• {name} — {koef:.2f}" for name, koef in team)
-    return "\n".join(lines)
+    lines = [f"⚖️ Составы — {total} игроков, {len(teams)} команды\n"]
+    for i, team in enumerate(teams, 1):
+        avg = sum(k for _, k in team) / len(team) if team else 0
+        lines.append(f"{('⚪', '⚫', '🔴')[i - 1]} Команда {i} ({('белые', 'чёрные', 'красные')[i - 1]}) (средний коэф. {avg:.2f}):")
+        lines += [f"• {n} — {k:.2f}" for n, k in team]
+        lines.append("")
+    if unknown:
+        lines.append(f"Без статистики (коэф. {fallback:.2f} — среднее по остальным): {', '.join(unknown)}")
+    return "\n".join(lines).strip()
 
 
 @dp.callback_query(lambda q: q.data == "publish_lineups")
@@ -340,7 +349,8 @@ async def publish_lineups(query: types.CallbackQuery):
         return await query.answer("Недоступно", show_alert=True)
     state = load_json(POLL_STATE_FILE, {})
     if state.get("draft_teams"):
-        text = format_public_lineups(state["draft_teams"])
+        teams = [[(name, koef) for name, koef in team] for team in state["draft_teams"]]
+        text = format_lineups(teams, state.get("unknown", []), state.get("fallback", 1.0))
         await bot.send_message(CHAT_ID, text)
         save_json(GUESTS_FILE, [])
     elif state.get("draft"):
@@ -610,15 +620,7 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
         players.append((name, koef))
     team_count = team_count_for(len(players))
     teams, spread = split_teams(players, team_count)
-    lines = [f"⚖️ Составы — {len(players)} игроков, {team_count} команды\n"]
-    for i, team in enumerate(teams, 1):
-        avg = sum(k for _, k in team) / len(team) if team else 0
-        lines.append(f"{('⚪', '⚫', '🔴')[i - 1]} Команда {i} ({('белые', 'чёрные', 'красные')[i - 1]}) (средний коэф. {avg:.2f}):")
-        lines += [f"• {n} — {k:.2f}" for n, k in team]
-        lines.append("")
-    if unknown:
-        lines.append(f"Без статистики (коэф. {fallback:.2f} — среднее по остальным): {', '.join(unknown)}")
-    await message.answer("\n".join(lines).strip())
+    await message.answer(format_lineups(teams, unknown, fallback))
 
 
 async def create_game_poll(chat_id: int):
