@@ -33,14 +33,14 @@ GUESTS_FILE = os.path.join(DATA_DIR, "guests.json")
 PLAYER_USERNAMES = {
     "Ларионов М.": "lmur2000", "Бобров М.": "BobrovMA1996",
     "Серганов А.": "aserganov", "Голыжбин Е.": "Evgen0090",
-    "Ковалев М.": "AkynaMatata555", "Баталов Е.": "BatlDad",
+    "Ковалёв М.": "AkynaMatata555", "Баталов Е.": "BatlDad",
     "Матвеев А.": "matveev_andrei", "Бессмертных С.": "getmorepower",
     "Мирасов Г.": "girfanmir", "Лучинин А.": "LuchininAleksandr",
     "Вахобов Г.": "INVESTORGULOM", "Влад": "VladislavOAR",
     "Антон": "Siimma445", "IIvajan": "IvaJan", "D": "dadadaann",
     "Alexandr": "Footmor", "Сикач И.": "tWoKizaa",
     "Моргун А.": "Cptmorgun", "Калабин Д.": "dv_kalabin",
-    "Чичин А.": "temachichin",
+    "Чичин А.": "temachichin", "Расчётов А.": "go-go131",
 }
 DISPLAY_ALIASES = {"михаил": "Волков М.", "вадим": "Большаков В.",
                    "q": "Расчётов А.", "zakhar miakushko": "Мякушко З."}
