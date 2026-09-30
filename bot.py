@@ -1,19 +1,26 @@
 """
 Футбольный бот «Мяч» — постоянная версия для Amvera
-Опросы по субботам + команды статистики и составов
+Опросы по субботам, статистика, составы, фактический состав игры,
+ввод результата и оплата из личного интерфейса администратора.
 """
 import asyncio
 import datetime
 import json
 import math
 import os
+import random
 import re
+import shutil
+import tempfile
 from itertools import combinations
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.client.session.aiohttp import AiohttpSession
+
+BOT_VERSION = "2026-10-01"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -29,21 +36,30 @@ OFFSET_FILE = os.path.join(DATA_DIR, "last_offset.txt")
 LAST_POLL_FILE = os.path.join(DATA_DIR, "last_poll.txt")
 POLL_STATE_FILE = os.path.join(DATA_DIR, "poll_state.json")
 GUESTS_FILE = os.path.join(DATA_DIR, "guests.json")
+PLAYERS_FILE = os.path.join(DATA_DIR, "players.json")
+GAME_FILE = os.path.join(DATA_DIR, "game.json")
+GAME_ARCHIVE_FILE = os.path.join(DATA_DIR, "game_archive.json")
+META_FILE = os.path.join(DATA_DIR, "ui_meta.json")
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+BACKUP_KEEP = 40
 
-PLAYER_USERNAMES = {
+# Начальный список игроков. Используется ТОЛЬКО для первого создания
+# /data/players.json; дальше источник правды — файл, которым управляет
+# Дмитрий из личного меню бота (без правки кода и перезапуска).
+DEFAULT_PLAYER_USERNAMES = {
     "Ларионов М.": "lmur2000", "Бобров М.": "BobrovMA1996",
     "Серганов А.": "aserganov", "Голыжбин Е.": "Evgen0090",
-    "Ковалев М.": "AkunaMatata555", "Баталов Е.": "BatlDad",
+    "Ковалёв М.": "AkynaMatata555", "Баталов Е.": "BatlDad",
     "Матвеев А.": "matveev_andrei", "Бессмертных С.": "getmorepower",
     "Мирасов Г.": "girfanmir", "Лучинин А.": "LuchininAleksandr",
     "Вахобов Г.": "INVESTORGULOM", "Влад": "VladislavOAR",
-    "Антон": "Simma445", "IIvajan": "IvaJan", "D": "dadadaann",
+    "Антон": "Siimma445", "IIvajan": "IvaJan", "D": "dadadaann",
     "Alexandr": "Footmor", "Сикач И.": "tWoKizaa",
     "Моргун А.": "Cptmorgun", "Калабин Д.": "dv_kalabin",
-    "Чичин А.": "temachichin",
+    "Чичин А.": "temachichin", "Расчётов А.": "go-go131",
 }
-DISPLAY_ALIASES = {"михаил": "Волков М.", "вадим": "Большаков В.",
-                   "q": "Расчётов А.", "zakhar miakushko": "Мякушко З."}
+DEFAULT_DISPLAY_ALIASES = {"михаил": "Волков М.", "вадим": "Большаков В.",
+                           "q": "Расчётов А.", "zakhar miakushko": "Мякушко З."}
 
 # Очки
 GOAL_POINTS = 2.0
@@ -55,13 +71,101 @@ PAYMENT_PHONE = "+79058056264"
 PAYMENT_BANK = "Озон Банк"
 BALL_FUND_RUB = 20  # надбавка сверху — копим на новый мяч
 
+TEAM_ICONS = ("⚪", "⚫", "🔴")
+TEAM_COLORS = ("белые", "чёрные", "красные")
+
+# Живое оформление: только текст сообщений, в расчётах не участвует.
+POLL_PHRASES = [
+    "⚽ Пора собирать состав!",
+    "⚽ Кто в игре?",
+    "⚽ Собираемся на футбол!",
+    "⚽ Мяч сам себя не погоняет!",
+    "⚽ Пора расчехлять бутсы!",
+    "⚽ Начинаем перекличку!",
+    "⚽ Пора определяться — играем!",
+    "⚽ Футбольный понедельник уже близко!",
+    "⚽ Кто на поле, а кто на диване?",
+    "⚽ Кто готов забивать, а кто — отдавать?",
+    "⚽ Понедельник. Футбол. Кто с нами?",
+]
+FINAL_PHRASES = [
+    "Всем хорошей игры! ⚽",
+    "Удачи на поле! ⚽",
+    "Красивой игры и без травм! 💪⚽",
+    "Всем удачи — увидимся на поле! ⚽",
+    "Хорошего футбола! ⚽",
+    "Пусть победит сильнейший! ⚽",
+    "Главное — без травм. Остальное на поле! ⚽",
+    "Команды готовы. Погнали! ⚽",
+    "Составы есть — осталось сыграть! ⚽",
+    "Всем хорошего футбола и отличного настроения! ⚽",
+]
+
 os.makedirs(DATA_DIR, exist_ok=True)
 
 bot = Bot(token=BOT_TOKEN, session=AiohttpSession(timeout=25))
 dp = Dispatcher()
 
+POLL_LOCK = asyncio.Lock()
+PUBLISH_LOCK = asyncio.Lock()
+RECORD_LOCK = asyncio.Lock()
+# Ожидание текстового ввода от Дмитрия (в памяти: после перезапуска
+# просто начать действие заново).
+AWAITING: dict = {}
+
+
+# ============================================================
+# Хранилище: атомарная запись, строгое чтение, резервные копии
+# ============================================================
+
+class DataCorrupted(Exception):
+    """Файл данных повреждён или имеет неожиданную структуру. Изменяющие
+    операции обязаны остановиться, исходный файл не перезаписывается."""
+
+    def __init__(self, path, reason):
+        super().__init__(f"{os.path.basename(path)}: {reason}")
+        self.path = path
+        self.reason = reason
+
+
+_MISSING = object()
+
+
+def atomic_write_text(path: str, text: str):
+    """Пишет во временный файл рядом и атомарно подменяет целевой —
+    обрыв посреди записи не оставляет наполовину записанный файл."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def save_json(path, data):
+    atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _preserve_corrupt(path):
+    try:
+        stamp = datetime.datetime.now(YEKB_TZ).strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(path, f"{path}.corrupt-{stamp}")
+    except Exception as e:
+        print(f"Не удалось сохранить копию повреждённого файла {path}: {e}")
+
 
 def load_json(path, default=None):
+    """Мягкое чтение для служебных файлов (опрос, игра, меню). При ошибке
+    разбора исходный файл сохраняется копией, возвращается default."""
     if default is None:
         default = {}
     if not os.path.exists(path):
@@ -69,13 +173,55 @@ def load_json(path, default=None):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        print(f"Не удалось прочитать {path}: {e}")
+        _preserve_corrupt(path)
         return default
 
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def load_json_strict(path):
+    """Строгое чтение для данных, потеря которых недопустима. Отсутствие
+    файла — _MISSING; нечитаемый файл — DataCorrupted (а не пустой словарь)."""
+    if not os.path.exists(path):
+        return _MISSING
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise DataCorrupted(path, f"{type(e).__name__}: {e}")
+
+
+def list_backups(prefix: str) -> list:
+    if not os.path.isdir(BACKUP_DIR):
+        return []
+    return sorted(n for n in os.listdir(BACKUP_DIR) if n.startswith(prefix + "-") and n.endswith(".json"))
+
+
+def backup_file(path: str, prefix: str):
+    """Копия действующего (читаемого) файла в /data/backups перед перезаписью.
+    Одинаковое содержимое повторно не копируется; хранятся последние BACKUP_KEEP."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        json.loads(raw.decode("utf-8"))  # повреждённое не подменяет хорошие копии
+        names = list_backups(prefix)
+        if names:
+            with open(os.path.join(BACKUP_DIR, names[-1]), "rb") as f:
+                if f.read() == raw:
+                    return
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        stamp = datetime.datetime.now(YEKB_TZ).strftime("%Y%m%d-%H%M%S-%f")
+        with open(os.path.join(BACKUP_DIR, f"{prefix}-{stamp}.json"), "wb") as f:
+            f.write(raw)
+        for old in list_backups(prefix)[:-BACKUP_KEEP]:
+            try:
+                os.unlink(os.path.join(BACKUP_DIR, old))
+            except OSError:
+                pass
+    except Exception as e:
+        print(f"Не удалось сделать резервную копию {path}: {e}")
 
 
 def load_offset() -> int:
@@ -93,15 +239,57 @@ def save_offset(offset: int):
         f.write(str(offset))
 
 
-def load_stats() -> dict:
-    data = load_json(STATS_FILE, {})
+# ============================================================
+# Статистика
+# ============================================================
+
+def _num_ok(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and v >= 0
+
+
+def normalize_stats(data) -> dict:
+    """Приводит старый формат к текущему и проверяет структуру.
+    ValueError — данные не похожи на статистику."""
+    if not isinstance(data, dict):
+        raise ValueError("корневой элемент не является словарём")
     for k, v in list(data.items()):
-        if isinstance(v, dict) and "players" not in v:
-            data[k] = {"players": v, "last": []}
+        if not isinstance(v, dict):
+            raise ValueError(f"раздел {k!r} не является словарём")
+        if "players" not in v:
+            data[k] = v = {"players": v, "last": []}
+        players = v["players"]
+        if not isinstance(players, dict):
+            raise ValueError(f"раздел {k!r}: players не словарь")
+        for name, rec in players.items():
+            if not isinstance(rec, dict):
+                raise ValueError(f"игрок {name!r}: запись не словарь")
+            for field in ("games", "goals", "assists"):
+                if field in rec and not _num_ok(rec[field]):
+                    raise ValueError(f"игрок {name!r}: поле {field} некорректно")
+        last = v.get("last", [])
+        if not isinstance(last, list) or any(
+            not (isinstance(e, (list, tuple)) and len(e) == 3) for e in last
+        ):
+            raise ValueError(f"раздел {k!r}: last некорректен")
     return data
 
 
+def load_stats() -> dict:
+    """Строго: повреждённая статистика НЕ превращается в пустую."""
+    data = load_json_strict(STATS_FILE)
+    if data is _MISSING:
+        if list_backups("stats"):
+            raise DataCorrupted(STATS_FILE, "файл отсутствует, хотя есть резервные копии")
+        return {}
+    try:
+        return normalize_stats(data)
+    except ValueError as e:
+        raise DataCorrupted(STATS_FILE, str(e))
+
+
 def save_stats(stats: dict):
+    normalize_stats(stats)
+    backup_file(STATS_FILE, "stats")
     save_json(STATS_FILE, stats)
 
 
@@ -116,6 +304,51 @@ def koef_of(rec: dict) -> float:
 
 def fmt_num(v: float) -> str:
     return f"{v:g}"
+
+
+def norm_key(s: str) -> str:
+    """Ключ сравнения имён: без регистра, ё = е, лишние пробелы убраны."""
+    return re.sub(r"\s+", " ", s.strip().replace("ё", "е").replace("Ё", "Е")).casefold()
+
+
+def find_key(name: str, candidates) -> str | None:
+    k = norm_key(name)
+    for c in candidates:
+        if norm_key(c) == k:
+            return c
+    return None
+
+
+def resolve_name(raw: str, stats_players=None, registered=()) -> str:
+    """Каноническое написание имени: сначала как уже записано в статистике,
+    затем как у зарегистрированного игрока, иначе — Обычный Регистр.
+    Так один человек не раздваивается из-за регистра, «ё/е» и пробелов."""
+    raw = re.sub(r"\s+", " ", raw.strip())
+    return find_key(raw, stats_players or {}) or find_key(raw, registered) or raw.title()
+
+
+def stats_players_of(stats: dict) -> dict:
+    return stats.get(str(CHAT_ID), {}).get("players", {})
+
+
+def record_match(players: list) -> list:
+    """Записывает игру в статистику: players — [(имя, голы, передачи)].
+    Возвращает записанные (каноническое имя, голы, передачи).
+    DataCorrupted — ничего не записано, файл не тронут."""
+    stats = load_stats()
+    registered = set(load_players()["players"])
+    chat = stats.setdefault(str(CHAT_ID), {"players": {}, "last": []})
+    written = []
+    for name, goals, assists in players:
+        cname = resolve_name(name, chat["players"], registered)
+        rec = chat["players"].setdefault(cname, {"games": 0, "goals": 0, "assists": 0})
+        rec["games"] = rec.get("games", 0) + 1
+        rec["goals"] = rec.get("goals", 0) + goals
+        rec["assists"] = rec.get("assists", 0) + assists
+        written.append((cname, goals, assists))
+    chat["last"] = [list(p) for p in written]
+    save_stats(stats)
+    return written
 
 
 def calc_payment_per_player(total: int, n: int) -> int:
@@ -140,6 +373,10 @@ def parse_match_line(text: str):
             errors.append(chunk)
     return players, errors
 
+
+# ============================================================
+# Алгоритм составов (без изменений)
+# ============================================================
 
 EXACT_LIMIT = 15  # до 15 игроков — точный перебор, дальше — эвристика
                   # (перебор от 16 игроков уже занимает больше 5 секунд)
@@ -246,13 +483,267 @@ def split_teams(players: list, team_count: int):
     return heuristic_split(players, team_count)
 
 
-def player_name_for(user: types.User) -> str | None:
-    username = (user.username or "").lower()
-    for name, saved_username in PLAYER_USERNAMES.items():
-        if username and username == saved_username.lower():
+def koef_for_names(names: list, ratings: dict, stats_players: dict):
+    """Действующее правило бота: у игрока со статистикой — его коэффициент;
+    у гостя с указанным рейтингом — рейтинг; иначе — средний коэффициент
+    известных игроков списка. Возвращает (коэффициенты, без статистики, среднее)."""
+    by_key = {norm_key(k): v for k, v in stats_players.items()}
+    known = []
+    for n in names:
+        rec = by_key.get(norm_key(n))
+        if rec and rec.get("games"):
+            known.append(koef_of(rec))
+    fallback = sum(known) / len(known) if known else 1.0
+    koefs, unknown = {}, []
+    for n in names:
+        rec = by_key.get(norm_key(n))
+        if rec and rec.get("games"):
+            koefs[n] = koef_of(rec)
+        elif ratings.get(n):
+            koefs[n] = float(ratings[n])
+        else:
+            koefs[n] = fallback
+            unknown.append(n)
+    return koefs, unknown, fallback
+
+
+def format_lineups(teams: list, unknown: list, fallback: float) -> str:
+    """Общий формат для /составы, личного черновика и публикации
+    в общий чат, чтобы выглядели одинаково."""
+    total = sum(len(team) for team in teams)
+    lines = [f"⚖️ Составы — {total} игроков, {len(teams)} команды\n"]
+    for i, team in enumerate(teams, 1):
+        avg = sum(k for _, k in team) / len(team) if team else 0
+        lines.append(f"{TEAM_ICONS[i - 1]} Команда {i} ({TEAM_COLORS[i - 1]}) (средний коэф. {avg:.2f}):")
+        lines += [f"• {n} — {k:.2f}" for n, k in team]
+        lines.append("")
+    if unknown:
+        lines.append(f"Без статистики (коэф. {fallback:.2f} — среднее по остальным): {', '.join(unknown)}")
+    return "\n".join(lines).strip()
+
+
+# ============================================================
+# Игроки и привязки (хранятся в /data/players.json)
+# ============================================================
+
+def _seed_players() -> dict:
+    players = {}
+    for name, username in DEFAULT_PLAYER_USERNAMES.items():
+        players[name] = {"usernames": [username], "ids": [], "aliases": []}
+    for display, name in DEFAULT_DISPLAY_ALIASES.items():
+        rec = players.setdefault(name, {"usernames": [], "ids": [], "aliases": []})
+        if display not in rec["aliases"]:
+            rec["aliases"].append(display)
+    return {"version": 1, "players": players}
+
+
+def validate_players(data):
+    if not isinstance(data, dict) or not isinstance(data.get("players"), dict):
+        raise ValueError("нет словаря players")
+    for name, rec in data["players"].items():
+        if not isinstance(rec, dict):
+            raise ValueError(f"игрок {name!r}: запись не словарь")
+        for field in ("usernames", "ids", "aliases"):
+            rec.setdefault(field, [])
+            if not isinstance(rec[field], list):
+                raise ValueError(f"игрок {name!r}: поле {field} не список")
+
+
+def load_players() -> dict:
+    data = load_json_strict(PLAYERS_FILE)
+    if data is _MISSING:
+        data = _seed_players()
+        save_json(PLAYERS_FILE, data)
+        print("Создан /data/players.json из начального списка")
+        return data
+    try:
+        validate_players(data)
+    except ValueError as e:
+        raise DataCorrupted(PLAYERS_FILE, str(e))
+    return data
+
+
+def save_players(data: dict):
+    validate_players(data)
+    backup_file(PLAYERS_FILE, "players")
+    save_json(PLAYERS_FILE, data)
+
+
+def clean_username(raw: str) -> str:
+    return raw.strip().lstrip("@").strip()
+
+
+def match_player(data: dict, user_id, username: str, display: str) -> str | None:
+    uname = (username or "").lower()
+    for name, rec in data["players"].items():
+        if user_id is not None and user_id in rec.get("ids", []):
             return name
-    display = " ".join(x for x in (user.first_name, user.last_name) if x).strip().lower()
-    return DISPLAY_ALIASES.get(display)
+    if uname:
+        for name, rec in data["players"].items():
+            if uname in (u.lower() for u in rec.get("usernames", [])):
+                return name
+    disp = (display or "").strip().lower()
+    if disp:
+        for name, rec in data["players"].items():
+            if disp in (a.lower() for a in rec.get("aliases", [])):
+                return name
+    return None
+
+
+def player_name_for(user: types.User) -> str | None:
+    try:
+        data = load_players()
+    except DataCorrupted as e:
+        print(f"Игроки недоступны: {e}")
+        return None
+    display = " ".join(x for x in (user.first_name, user.last_name) if x)
+    return match_player(data, user.id, user.username or "", display)
+
+
+def players_add(name: str, username: str | None = None) -> str:
+    """Добавляет игрока; возвращает каноническое имя. ValueError — дубль/пусто."""
+    name = re.sub(r"\s+", " ", name.strip())
+    if not name:
+        raise ValueError("Пустое имя.")
+    data = load_players()
+    if find_key(name, data["players"]):
+        raise ValueError(f"Игрок «{find_key(name, data['players'])}» уже есть.")
+    data["players"][name] = {"usernames": [clean_username(username)] if username else [], "ids": [], "aliases": []}
+    save_players(data)
+    return name
+
+
+def players_remove(name: str) -> str:
+    data = load_players()
+    key = find_key(name, data["players"])
+    if not key:
+        raise ValueError(f"Игрока «{name}» нет.")
+    del data["players"][key]
+    save_players(data)
+    return key
+
+
+def players_bind(name: str, username: str | None = None, user_id=None, alias: str | None = None) -> str:
+    data = load_players()
+    key = find_key(name, data["players"])
+    if not key:
+        raise ValueError(f"Игрока «{name}» нет.")
+    rec = data["players"][key]
+    if username:
+        u = clean_username(username)
+        if u and u.lower() not in (x.lower() for x in rec["usernames"]):
+            rec["usernames"].append(u)
+    if user_id is not None and user_id not in rec["ids"]:
+        rec["ids"].append(user_id)
+    if alias:
+        a = alias.strip().lower()
+        if a and a not in (x.lower() for x in rec["aliases"]):
+            rec["aliases"].append(a)
+    save_players(data)
+    return key
+
+
+# ============================================================
+# Живое оформление (ротация фраз без повторов подряд)
+# ============================================================
+
+def pick_phrase(kind: str, phrases: list, rng=random) -> str:
+    meta = load_json(META_FILE, {})
+    last = meta.get(f"last_{kind}")
+    choices = [i for i in range(len(phrases)) if i != last] or list(range(len(phrases)))
+    idx = rng.choice(choices)
+    meta[f"last_{kind}"] = idx
+    try:
+        save_json(META_FILE, meta)
+    except Exception as e:
+        print(f"Не удалось сохранить ротацию фраз: {e}")
+    return phrases[idx]
+
+
+# ============================================================
+# Опрос
+# ============================================================
+
+def poll_done_today(day: datetime.date) -> bool:
+    """Сегодняшний опрос уже создан — автоматикой или вручную."""
+    if os.path.exists(LAST_POLL_FILE):
+        try:
+            with open(LAST_POLL_FILE) as f:
+                if datetime.date.fromisoformat(f.read().strip()) == day:
+                    return True
+        except Exception:
+            pass
+    return load_json(POLL_STATE_FILE, {}).get("date") == day.isoformat()
+
+
+async def create_game_poll(chat_id: int, *, manual: bool = False) -> str:
+    """Публикует опрос. В субботу и ручной, и автоматический опрос считаются
+    «опросом этой субботы» (общий маркер), поэтому автоматика не пришлёт
+    второй. Ручной опрос в другой день маркер субботы не ставит."""
+    now = datetime.datetime.now(YEKB_TZ)
+    today = now.date()
+    days_until_monday = (7 - today.weekday()) % 7
+    if days_until_monday == 0:
+        days_until_monday = 7
+    monday = today + datetime.timedelta(days=days_until_monday)
+    phrase = pick_phrase("poll", POLL_PHRASES)
+    question = f"{phrase} Футбол Лестех понедельник {monday.strftime('%d.%m.%Y')} {GAME_TIME}"
+    poll_message = await bot.send_poll(
+        chat_id=chat_id,
+        question=question,
+        options=["+", "-"],
+        is_anonymous=False,
+    )
+    save_json(POLL_STATE_FILE, {
+        "poll_id": poll_message.poll.id,
+        "message_id": poll_message.message_id,
+        "date": today.isoformat(),
+        "voters": {},
+        "manual": manual,
+    })
+    if today.weekday() == 5:
+        with open(LAST_POLL_FILE, "w") as f:
+            f.write(today.isoformat())
+    print(f"Опрос отправлен ({'вручную' if manual else 'авто'}): {question}")
+    return question
+
+
+async def maybe_send_poll(now: datetime.datetime | None = None) -> bool:
+    """Автоопрос: суббота, начиная с 12:00 (по Екатеринбургу). Если бот был
+    выключен и вернулся позже в ту же субботу — опрос всё равно создаётся,
+    но не больше одного за день."""
+    now = now or datetime.datetime.now(YEKB_TZ)
+    if now.weekday() != 5 or now.hour < 12:
+        return False
+    if poll_done_today(now.date()):
+        return False
+    async with POLL_LOCK:
+        if poll_done_today(now.date()):
+            return False
+        try:
+            await create_game_poll(CHAT_ID)
+            return True
+        except Exception as e:
+            print(f"Ошибка отправки опроса: {e}")
+            return False
+
+
+async def poll_scheduler():
+    """Раз в минуту проверяет, не пора ли отправить опрос.
+
+    17.09.2026: процесс формально не падал (событий рестарта не было),
+    но кнопки меню не отвечали почти сутки — а в логах за это время не
+    было ни строчки. Теперь раз в ~30 минут пишем простое "сердцебиение"
+    — не чинит зависание само по себе, но хотя бы видно в getRunLogs,
+    что цикл ещё тикает."""
+    tick = 0
+    print(f"[DEBUG] планировщик опроса запущен {datetime.datetime.now(YEKB_TZ):%d.%m.%Y %H:%M}")
+    while True:
+        await maybe_send_poll()
+        tick += 1
+        if tick % 30 == 0:
+            print(f"[DEBUG] планировщик жив, тик {tick}, {datetime.datetime.now(YEKB_TZ):%d.%m.%Y %H:%M}")
+        await asyncio.sleep(60)
 
 
 @dp.poll_answer()
@@ -273,61 +764,345 @@ async def poll_answer(answer: types.PollAnswer):
     save_json(POLL_STATE_FILE, state)
 
 
-@dp.message(Command("добавить"))
-async def cmd_add_guest(message: types.Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID or message.chat.type != "private":
-        return
-    if not command.args:
-        return await message.answer("Формат: /добавить Алексей, Максим 2.3")
-    guests = load_json(GUESTS_FILE, [])
-    for part in command.args.split(","):
-        part = part.strip()
-        m = re.match(r"^(.+?)(?:\s+(\d+(?:[.,]\d+)?))?$", part)
-        if m:
-            guests.append({"name": m.group(1).strip(), "rating": float(m.group(2).replace(",", ".")) if m.group(2) else None})
-    save_json(GUESTS_FILE, guests)
-    await message.answer("Добавлены: " + ", ".join(g["name"] for g in guests))
+# ============================================================
+# Фактический состав игры (game.json)
+# ============================================================
+
+def now_iso() -> str:
+    return datetime.datetime.now(YEKB_TZ).isoformat(timespec="seconds")
 
 
-@dp.message(Command("разделить", "split"))
-async def cmd_split_poll(message: types.Message):
-    if message.from_user.id != OWNER_ID or message.chat.type != "private":
-        return
-    state = load_json(POLL_STATE_FILE, {})
-    voters = list(state.get("voters", {}).values())
-    unresolved = [v["display"] or ("@" + v["username"]) for v in voters if not v.get("player")]
-    if unresolved:
-        return await message.answer("Сначала нужно привязать: " + ", ".join(unresolved))
-    names = [v["player"] for v in voters] + [g["name"] for g in load_json(GUESTS_FILE, [])]
+def load_game() -> dict | None:
+    g = load_json(GAME_FILE, None)
+    return g if isinstance(g, dict) and isinstance(g.get("teams"), list) else None
+
+
+def save_game(g: dict):
+    save_json(GAME_FILE, g)
+
+
+def archive_game(g: dict):
+    archive = load_json(GAME_ARCHIVE_FILE, [])
+    if not isinstance(archive, list):
+        archive = []
+    archive.append(g)
+    save_json(GAME_ARCHIVE_FILE, archive[-20:])
+
+
+def new_game(teams: list, ratings: dict | None = None, guests=()) -> dict:
+    names_teams = [[n for n in team] for team in teams]
+    return {
+        "id": datetime.datetime.now(YEKB_TZ).strftime("%Y%m%d%H%M%S"),
+        "created": now_iso(),
+        "rev": 1,
+        "initial": [list(t) for t in names_teams],
+        "teams": names_teams,
+        "ratings": dict(ratings or {}),
+        "guests": list(guests),
+        "history": [],
+        "published_rev": None,
+        "payment_rev": None,
+        "result": None,
+        "result_recorded": False,
+        "pending": None,
+    }
+
+
+def game_players(g: dict) -> list:
+    return [n for team in g["teams"] for n in team]
+
+
+def squad_flat(g: dict) -> list:
+    return [(ti, n) for ti, team in enumerate(g["teams"]) for n in team]
+
+
+def _log(g: dict, **kw):
+    g["history"].append({"t": now_iso(), **kw})
+    g["rev"] += 1
+
+
+def _find_in_squad(g: dict, name: str):
+    for ti, team in enumerate(g["teams"]):
+        for pos, n in enumerate(team):
+            if norm_key(n) == norm_key(name):
+                return ti, pos
+    return None
+
+
+def squad_remove(g: dict, name: str):
+    loc = _find_in_squad(g, name)
+    if not loc:
+        raise ValueError(f"«{name}» нет в составе.")
+    ti, pos = loc
+    removed = g["teams"][ti].pop(pos)
+    _log(g, type="remove", name=removed, team=ti + 1)
+
+
+def _register_guest(g: dict, name: str, rating, guest: bool):
+    if guest and name not in g["guests"]:
+        g["guests"].append(name)
+    if rating:
+        g["ratings"][name] = float(rating)
+
+
+def squad_add(g: dict, name: str, team_idx: int, rating=None, guest=False):
+    if _find_in_squad(g, name):
+        raise ValueError(f"«{name}» уже в составе.")
+    if not 0 <= team_idx < len(g["teams"]):
+        raise ValueError("Нет такой команды.")
+    g["teams"][team_idx].append(name)
+    _register_guest(g, name, rating, guest)
+    _log(g, type="add", name=name, team=team_idx + 1, guest=guest, mode="place")
+
+
+def squad_replace_in_place(g: dict, out_name: str, new_name: str, rating=None, guest=False):
+    """Новый игрок занимает место выбывшего в той же команде."""
+    if _find_in_squad(g, new_name):
+        raise ValueError(f"«{new_name}» уже в составе.")
+    loc = _find_in_squad(g, out_name)
+    if not loc:
+        raise ValueError(f"«{out_name}» нет в составе.")
+    ti, pos = loc
+    outgoing = g["teams"][ti][pos]
+    g["teams"][ti][pos] = new_name
+    _register_guest(g, new_name, rating, guest)
+    _log(g, type="replace", out=outgoing, **{"in": new_name}, team=ti + 1, guest=guest, mode="place")
+
+
+def squad_rebuild(g: dict, stats_players: dict, reason: str = "rebuild"):
+    """Новый фактический список целиком проходит через алгоритм деления."""
+    names = game_players(g)
     if len(names) < 2:
-        return await message.answer("Для деления нужно минимум два игрока.")
-    stats = load_stats().get(str(CHAT_ID), {}).get("players", {})
-    known = [koef_of(stats[n]) for n in names if n in stats and stats[n].get("games")]
-    fallback = sum(known) / len(known) if known else 1.0
-    guest_ratings = {g["name"]: g.get("rating") for g in load_json(GUESTS_FILE, [])}
-    players = [(n, koef_of(stats[n]) if n in stats and stats[n].get("games") else (guest_ratings.get(n) or fallback)) for n in names]
-    teams, _ = split_teams(players, team_count_for(len(players)))
-    lines = ["⚖️ Предварительные составы"]
-    for i, team in enumerate(teams, 1):
-        lines.append(f"\n{('⚪', '⚫', '🔴')[i - 1]} Команда {i} ({('белые', 'чёрные', 'красные')[i - 1]}):")
-        lines.extend(f"• {name}" for name, _ in team)
-    text = "\n".join(lines)
-    state["draft"] = text
-    save_json(POLL_STATE_FILE, state)
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[[types.InlineKeyboardButton(text="Опубликовать в общий чат", callback_data="publish_lineups")]])
-    await message.answer(text, reply_markup=keyboard)
+        raise ValueError("Для деления нужно минимум два игрока.")
+    koefs, _, _ = koef_for_names(names, g["ratings"], stats_players)
+    teams, _ = split_teams([(n, koefs[n]) for n in names], team_count_for(len(names)))
+    g["teams"] = [[n for n, _ in team] for team in teams]
+    _log(g, type="rebuild", reason=reason)
 
 
-@dp.callback_query(lambda q: q.data == "publish_lineups")
-async def publish_lineups(query: types.CallbackQuery):
-    if query.from_user.id != OWNER_ID:
-        return await query.answer("Недоступно", show_alert=True)
-    state = load_json(POLL_STATE_FILE, {})
-    if state.get("draft"):
-        await bot.send_message(CHAT_ID, state["draft"])
-        save_json(GUESTS_FILE, [])
-    await query.answer("Опубликовано")
+def squad_replace_rebuild(g: dict, out_name: str, new_name: str, stats_players: dict, rating=None, guest=False):
+    if _find_in_squad(g, new_name):
+        raise ValueError(f"«{new_name}» уже в составе.")
+    loc = _find_in_squad(g, out_name)
+    if not loc:
+        raise ValueError(f"«{out_name}» нет в составе.")
+    ti, pos = loc
+    outgoing = g["teams"][ti].pop(pos)
+    smallest = min(range(len(g["teams"])), key=lambda i: len(g["teams"][i]))
+    g["teams"][smallest].append(new_name)
+    _register_guest(g, new_name, rating, guest)
+    squad_rebuild(g, stats_players, reason="replace")
+    g["history"][-1].update({"type": "replace", "out": outgoing, "in": new_name, "mode": "rebuild", "guest": guest})
 
+
+def teams_with_koef(g: dict, stats_players: dict):
+    names = game_players(g)
+    koefs, unknown, fallback = koef_for_names(names, g["ratings"], stats_players)
+    return [[(n, koefs[n]) for n in team] for team in g["teams"]], unknown, fallback
+
+
+def lineup_text(g: dict, stats_players: dict) -> str:
+    teams, unknown, fallback = teams_with_koef(g, stats_players)
+    return format_lineups(teams, unknown, fallback)
+
+
+def publish_text(g: dict, stats_players: dict) -> str:
+    header = "🔄 Обновлённые составы (замены в составе)\n\n" if g.get("published_rev") is not None else ""
+    return f"{header}{lineup_text(g, stats_players)}\n\n{pick_phrase('final', FINAL_PHRASES)}"
+
+
+def squad_text(g: dict, stats_players: dict, header: str = "") -> str:
+    teams, unknown, fallback = teams_with_koef(g, stats_players)
+    n = sum(len(t) for t in teams)
+    lines = []
+    if header:
+        lines += [header, ""]
+    lines.append(f"⚙️ Фактический состав — {n} игроков (изменений: {len(g['history'])})")
+    avgs = []
+    for i, team in enumerate(teams):
+        avg = sum(k for _, k in team) / len(team) if team else 0
+        avgs.append(avg)
+        lines.append(f"\n{TEAM_ICONS[i]} Команда {i + 1} ({TEAM_COLORS[i]}) — {len(team)} чел., ср. {avg:.2f}")
+        lines += [f"• {name} — {k:.2f}" for name, k in team]
+    if avgs:
+        lines.append(f"\nБаланс: разброс средних {max(avgs) - min(avgs):.2f}")
+    if unknown:
+        lines.append(f"Без статистики (коэф. {fallback:.2f} — среднее по остальным): {', '.join(unknown)}")
+    if g.get("published_rev") == g["rev"]:
+        lines.append("📢 Этот состав опубликован в общем чате.")
+    else:
+        lines.append("📢 Актуальный состав ещё не опубликован в общем чате.")
+    return "\n".join(lines)
+
+
+def history_text(g: dict) -> str:
+    if not g["history"]:
+        return "Изменений состава пока не было."
+    lines = ["📜 История изменений (первоначальный состав сохранён)"]
+    for h in g["history"]:
+        when = f"{h['t'][8:10]}.{h['t'][5:7]} {h['t'][11:16]}"
+        if h["type"] == "remove":
+            lines.append(f"{when} — ➖ убран {h['name']}")
+        elif h["type"] == "add":
+            lines.append(f"{when} — ➕ добавлен {h['name']}")
+        elif h["type"] == "replace":
+            how = "на его место" if h.get("mode") == "place" else "с пересборкой команд"
+            lines.append(f"{when} — 🔄 {h['out']} → {h['in']} ({how})")
+        else:
+            lines.append(f"{when} — 🔁 команды пересобраны")
+    return "\n".join(lines)
+
+
+# ---- результат матча -------------------------------------------------------
+
+def result_init(g: dict):
+    """Черновик ввода результата по фактическому составу; значения игроков,
+    оставшихся в составе, сохраняются."""
+    roster = game_players(g)
+    old = g.get("result") or {}
+    g["result"] = {
+        "roster": roster,
+        "g": {n: v for n, v in old.get("g", {}).items() if n in roster},
+        "a": {n: v for n, v in old.get("a", {}).items() if n in roster},
+    }
+
+
+def result_adjust(g: dict, idx: int, field: str, delta: int):
+    res = g["result"]
+    name = res["roster"][idx]
+    res[field][name] = max(0, min(99, res[field].get(name, 0) + delta))
+
+
+def result_entries(g: dict) -> list:
+    res = g["result"]
+    return [(n, res["g"].get(n, 0), res["a"].get(n, 0)) for n in res["roster"]]
+
+
+# ============================================================
+# Тексты: Help
+# ============================================================
+
+HELP_SECTIONS = {
+    "poll": (
+        "🗳 ОПРОС\n\n"
+        "Что делает: раз в неделю публикует в общем чате опрос «+ / −» на ближайший понедельник. "
+        "Текст начинается с короткой фразы, затем «Футбол Лестех понедельник <дата> 21.30-23.00».\n\n"
+        "Автоматически: суббота, 12:00 (Екатеринбург). Если бот был выключен и вернулся позже "
+        "в ту же субботу — создаст опрос после запуска. Одна суббота — один опрос.\n\n"
+        "Вручную: кнопка «🗳 Опрос» в меню или /опрос (/poll). Ручной опрос в субботу считается "
+        "субботним — автоматика второй не пришлёт. Если опрос за сегодня уже есть, "
+        "повторный создаётся только командой /опрос да.\n\n"
+        "Ограничения: опрос всегда на ближайший понедельник; автокатч-ап работает только в субботу."
+    ),
+    "players": (
+        "👥 ИГРОКИ\n\n"
+        "Что делает: список игроков и привязка telegram-аккаунтов к именам. Хранится в /data/players.json, "
+        "править код и перезапускать бота не нужно.\n\n"
+        "В меню: «👥 Игроки» — список, добавить, привязать username, удалить. "
+        "Если при /разделить есть проголосовавший без привязки — под сообщением появятся кнопки привязки.\n\n"
+        "Команды:\n"
+        "/игроки — показать список\n"
+        "/игрок добавить Фамилия И. @username — новый игрок (username можно не указывать)\n"
+        "/игрок удалить Фамилия И.\n"
+        "/игрок username Фамилия И. @новый — добавить ещё один username\n"
+        "/привязать @username = Фамилия И. — привязать аккаунт\n\n"
+        "Пример: /игрок добавить Иванов П. @ivanov\n\n"
+        "Ограничения: удаление игрока не трогает его статистику. Имена сравниваются без учёта "
+        "регистра и «ё/е»."
+    ),
+    "split": (
+        "⚖️ СОСТАВЫ\n\n"
+        "/разделить (/split) — только в личном чате. Берёт проголосовавших «+», добавляет гостей "
+        "(/добавить Алексей, Максим 2.3 — рейтинг по желанию) и делит на 2 команды (до 14 человек) "
+        "или 3 (от 15). Игрок без статистики получает средний коэффициент остальных; у гостя с "
+        "рейтингом используется рейтинг.\n\n"
+        "Черновик приходит вам в личку. «📢 Опубликовать в общий чат» срабатывает ОДИН раз: после отправки "
+        "кнопка меняется на «✅ Опубликовано». Если отправка не удалась — кнопка остаётся.\n\n"
+        "⚙️ Изменить состав (/состав) — работает с фактическим составом, в том числе после публикации: "
+        "➕ добавить (игрока или гостя), ➖ убрать, 🔄 заменить. Замена: «📌 Поставить на его место» "
+        "(та же команда, остальные не меняются) или «🔄 Пересобрать команды» (заново по коэффициентам). "
+        "Первоначальный состав сохраняется, история изменений доступна. После правок появится кнопка "
+        "«📢 Опубликовать обновлённый состав».\n\n"
+        "Ручной вариант для всех: /составы Иванов, Петров, ... — разбить список (в фактический состав "
+        "не записывается).\n\n"
+        "Ограничения: /разделить и /добавить работают только в личке; новый /разделить начинает новую игру "
+        "(прежняя уходит в архив)."
+    ),
+    "match": (
+        "⚽ МАТЧ\n\n"
+        "Кнопка «⚽ Внести результат матча» (или /результат). Игроки берутся из ФАКТИЧЕСКОГО состава. "
+        "Нажмите на игрока и выставите ⚽ голы и 🎯 передачи кнопками ➖/➕ (по умолчанию 0/0 — "
+        "меняйте только тех, кто забил или отдал). Затем «➡️ Далее» — предварительный просмотр. "
+        "Статистика меняется только после «✅ Записать матч». «✏️ Изменить» возвращает к вводу, "
+        "«❌ Отмена» ничего не записывает.\n\n"
+        "Резервный текстовый способ: /матч Иванов 2+1, Петров 0+3, Соломин — «голы+передачи», игрок без "
+        "цифр записывается как 0+0. Эта команда доступна и участникам общего чата.\n\n"
+        "Отмена: /отменить убирает последнюю записанную игру (одну).\n\n"
+        "Ограничения: результат одного состава записывается один раз — повтор блокируется; если состав "
+        "изменился, ввод идёт уже по новому. Гость после записи попадает в статистику под своим именем; "
+        "регистр и «ё/е» не создают дублей."
+    ),
+    "stats": (
+        "📊 СТАТИСТИКА\n\n"
+        "/статистика (/stats) — таблица: И — игры, Г — голы, П — передачи, О — очки (гол = 2, "
+        "передача = 1), К — коэффициент = очки / игры.\n\n"
+        "/переименовать Старое = Новое — объединяет записи игрока (например, после смены написания).\n"
+        "/обнулить да — стирает всю статистику (без слова «да» не сработает).\n\n"
+        "Защита: запись атомарная; перед изменением делается копия в /data/backups (последние 40). "
+        "Если stats.json повреждён или непонятен, бот НЕ считает его пустым: изменяющие операции "
+        "останавливаются, файл сохраняется, вам приходит сообщение об ошибке.\n\n"
+        "Ограничения: статистика общая на один чат; истории по датам нет, кроме одной последней игры для /отменить."
+    ),
+    "pay": (
+        "💰 ОПЛАТА\n\n"
+        "Кнопка «💰 Рассчитать оплату». Число игроков берётся из ФАКТИЧЕСКОГО состава (с учётом замен). "
+        "Формула прежняя: 4500 ₽ делится на число игроков, округляется вверх до 10 ₽, "
+        "плюс 20 ₽ на мяч. Бот показывает предварительный просмотр сообщения; в общий чат оно уходит только "
+        "после «✅ Отправить в общий чат» и один раз для этого состава.\n\n"
+        "Резервный ручной вариант: /оплата N (/pay N), например /оплата 14. Без числа бот покажет "
+        "кнопки 12–18.\n\n"
+        "Ограничения: больше 30 игроков бот не принимает; если состав изменился, расчёт нужно открыть заново."
+    ),
+    "misc": (
+        "🔧 СЛУЖЕБНЫЕ\n\n"
+        "/start — приветствие и панель администратора\n"
+        "/menu — панель администратора (кнопки всех функций)\n"
+        "/help — эта инструкция\n"
+        "/id — ID чата и ваш ID\n"
+        "/отмена — сбросить ожидание ввода текста\n\n"
+        "Меню команд (кнопка «Функции») показывается только в вашем личном чате с ботом; в общем чате и "
+        "у остальных его нет. Сами команды работают по-прежнему.\n\n"
+        "При каждом запуске бот присылает вам сообщение «🟢 Мяч запущен» с состоянием статистики, "
+        "игроков и меню.\n\n"
+        "Данные в /data: stats.json (статистика), players.json (игроки), poll_state.json (опрос и голоса), "
+        "game.json / game_archive.json (фактический состав), guests.json, backups/.\n\n"
+        "Правило: любая новая admin-функция добавляется в этот Help в том же изменении."
+    ),
+}
+HELP_TITLES = {
+    "poll": "🗳 Опрос", "players": "👥 Игроки", "split": "⚖️ Составы", "match": "⚽ Матч",
+    "stats": "📊 Статистика", "pay": "💰 Оплата", "misc": "🔧 Служебные",
+}
+HELP_ALL_TEXT = "\n".join(HELP_SECTIONS.values())
+
+PLAYER_HELP = (
+    "Команды:\n"
+    "/матч Иванов 2+1, Петров 0+3, Соломин — записать игру\n"
+    "/статистика — таблица\n"
+    "/составы Иванов, Петров, ... — разбить на команды\n"
+    "/опрос — сразу опубликовать опрос на понедельник (на случай сбоя автоматики)\n"
+    "/разделить — разбить проголосовавших «+» на команды\n"
+    "/отменить — убрать последнюю игру\n"
+    "/переименовать Старое = Новое\n"
+    "/обнулить — стереть статистику\n"
+    "/id — узнать ID\n\n"
+    "Опрос публикуется автоматически каждую субботу в 12:00."
+)
+
+
+# ============================================================
+# Права и общие хелперы интерфейса
+# ============================================================
 
 # Команды, доступные любому участнику чата — то, чем пользуются каждую игру.
 # «Переименовать» и «обнулить» — только владельцу, это не игровые действия.
@@ -346,9 +1121,103 @@ def target_chat(message: types.Message) -> int:
     return CHAT_ID
 
 
+def is_owner_private(message) -> bool:
+    return bool(message.from_user and message.from_user.id == OWNER_ID and message.chat.type == "private")
+
+
+def owner_cb_ok(query) -> bool:
+    return bool(
+        query.from_user and query.from_user.id == OWNER_ID
+        and query.message is not None and query.message.chat.type == "private"
+    )
+
+
+def kb(rows: list) -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def btn(text: str, data: str) -> types.InlineKeyboardButton:
+    return types.InlineKeyboardButton(text=text, callback_data=data)
+
+
+def chunk_rows(buttons: list, per_row: int = 2) -> list:
+    return [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
+
+
+async def ack(query, text: str | None = None, alert: bool = False):
+    """Ответ на callback, безопасный при повторном вызове."""
+    try:
+        if text is None:
+            await query.answer()
+        else:
+            await query.answer(text, show_alert=alert)
+    except Exception:
+        pass
+
+
+async def edit_or_send(query, text: str, markup=None):
+    try:
+        await query.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e).lower():
+            await query.message.answer(text, reply_markup=markup)
+    except Exception:
+        await query.message.answer(text, reply_markup=markup)
+
+
+async def report_data_error(e: DataCorrupted, message=None, query=None):
+    """Понятная ошибка Дмитрию; при вызове из общего чата — короткий ответ там."""
+    text = (
+        "⚠️ Данные повреждены или не читаются — операция остановлена, файл НЕ изменён.\n"
+        f"Файл: {os.path.basename(e.path)}\nПричина: {e.reason}\n\n"
+        "Исходный файл сохранён как есть, автоматические копии — в /data/backups. "
+        "Пока проблема не устранена, изменяющие операции со статистикой недоступны."
+    )
+    print(f"[DATA ERROR] {e}")
+    in_owner_private = (
+        (message is not None and is_owner_private(message)) or (query is not None and owner_cb_ok(query))
+    )
+    try:
+        if in_owner_private:
+            target = message if message is not None else query.message
+            await target.answer(text)
+        else:
+            await bot.send_message(OWNER_ID, text)
+            if message is not None:
+                await message.answer("⚠️ Статистика временно недоступна, администратор уведомлён.")
+    except Exception as err:
+        print(f"Не удалось сообщить об ошибке данных: {err}")
+    if query is not None:
+        await ack(query, "Ошибка данных", True)
+
+
+def main_panel() -> types.InlineKeyboardMarkup:
+    return kb([
+        [btn("🗳 Опрос", "m:poll"), btn("👥 Игроки", "m:players")],
+        [btn("⚖️ Составы (разделить)", "m:split"), btn("⚙️ Изменить состав", "m:squad")],
+        [btn("⚽ Внести результат матча", "m:result"), btn("💰 Рассчитать оплату", "m:pay")],
+        [btn("📊 Статистика", "m:stats"), btn("❓ Help", "m:help")],
+    ])
+
+
+PANEL_TEXT = "⚽ Мяч — панель администратора\nВыберите действие."
+
+
+# ============================================================
+# Базовые команды
+# ============================================================
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if not is_allowed(message, "start"):
+        return
+    if is_owner_private(message):
+        AWAITING.pop(OWNER_ID, None)
+        await message.answer(
+            f"Привет, {message.from_user.first_name}!\nЯ бот «Мяч». Ниже — панель администратора, "
+            "подробная инструкция — в «❓ Help».",
+            reply_markup=main_panel(),
+        )
         return
     await message.answer(
         f"Привет, {message.from_user.first_name}!\n"
@@ -357,23 +1226,42 @@ async def cmd_start(message: types.Message):
     )
 
 
+@dp.message(Command("menu", "меню"))
+async def cmd_menu(message: types.Message):
+    if not is_owner_private(message):
+        return
+    AWAITING.pop(OWNER_ID, None)
+    await message.answer(PANEL_TEXT, reply_markup=main_panel())
+
+
+@dp.message(Command("отмена", "cancel"))
+async def cmd_cancel(message: types.Message):
+    if not is_owner_private(message):
+        return
+    AWAITING.pop(OWNER_ID, None)
+    await message.answer("Ожидание ввода сброшено.", reply_markup=main_panel())
+
+
+def help_home_markup() -> types.InlineKeyboardMarkup:
+    keys = list(HELP_SECTIONS)
+    return kb(chunk_rows([btn(HELP_TITLES[k], f"hp:{k}") for k in keys], 2) + [[btn("⬅️ Меню", "m:home")]])
+
+
+HELP_HOME_TEXT = (
+    "❓ Help — инструкция администратора\n\n"
+    "Выберите раздел: для каждой функции — что делает, как пользоваться, текстовая команда, "
+    "пример и ограничения."
+)
+
+
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     if not is_allowed(message, "help"):
         return
-    await message.answer(
-        "Команды:\n"
-        "/матч Иванов 2+1, Петров 0+3, Соломин — записать игру\n"
-        "/статистика — таблица\n"
-        "/составы Иванов, Петров, ... — разбить на команды\n"
-        "/опрос — сразу опубликовать опрос на понедельник (на случай сбоя автоматики)\n"
-        "/разделить — разбить проголосовавших «+» на команды\n"
-        "/отменить — убрать последнюю игру\n"
-        "/переименовать Старое = Новое\n"
-        "/обнулить — стереть статистику\n"
-        "/id — узнать ID\n\n"
-        "Опрос публикуется автоматически каждую субботу в 12:00."
-    )
+    if is_owner_private(message):
+        await message.answer(HELP_HOME_TEXT, reply_markup=help_home_markup())
+        return
+    await message.answer(PLAYER_HELP)
 
 
 @dp.message(Command("id"))
@@ -387,38 +1275,796 @@ async def cmd_id(message: types.Message):
     )
 
 
-@dp.message(Command("матч"))
-async def cmd_match(message: types.Message, command: CommandObject):
-    if not is_allowed(message, "матч"):
-        return
-    usage = (
-        "Формат:\n"
-        "/матч Иванов 2+1, Петров 0+3, Соломин\n\n"
-        "Гол = 2 очка, пас = 1 очко."
-    )
-    if not command.args:
-        await message.answer(usage)
-        return
-    players, errors = parse_match_line(command.args)
-    if not players:
-        await message.answer(f"Не понял игроков.\n{usage}")
-        return
-    stats = load_stats()
-    chat = stats.setdefault(str(target_chat(message)), {"players": {}, "last": []})
-    for name, goals, assists in players:
-        rec = chat["players"].setdefault(name, {"games": 0, "goals": 0, "assists": 0})
-        rec["games"] += 1
-        rec["goals"] += goals
-        rec["assists"] += assists
-    chat["last"] = [list(p) for p in players]
-    save_stats(stats)
-    lines = [f"Записал игру ({len(players)} чел.):"]
-    for name, g, a in players:
-        lines.append(f"• {name}: {g}+{a}")
-    if errors:
-        lines.append(f"\nНе разобрал: {', '.join(errors)}")
-    await message.answer("\n".join(lines))
+@dp.callback_query(F.data.startswith("hp:"))
+async def cb_help(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    key = query.data.split(":", 1)[1]
+    markup = kb([[btn("⬅️ К разделам", "m:help")]])
+    await edit_or_send(query, HELP_SECTIONS.get(key, HELP_HOME_TEXT), markup)
+    await ack(query)
 
+
+# ============================================================
+# Панель администратора
+# ============================================================
+
+@dp.callback_query(F.data.startswith("m:"))
+async def cb_panel(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    action = query.data.split(":", 1)[1]
+    AWAITING.pop(OWNER_ID, None)
+    if action == "home":
+        await edit_or_send(query, PANEL_TEXT, main_panel())
+    elif action == "help":
+        await edit_or_send(query, HELP_HOME_TEXT, help_home_markup())
+    elif action == "players":
+        await show_players(query)
+    elif action == "split":
+        await do_split(query.message.answer)
+    elif action == "squad":
+        await show_squad(query)
+    elif action == "result":
+        await show_result_menu(query)
+    elif action == "pay":
+        await show_payment(query)
+    elif action == "stats":
+        await send_stats(query.message.answer)
+    elif action == "poll":
+        if poll_done_today(datetime.datetime.now(YEKB_TZ).date()):
+            note = "\n\n⚠️ Опрос на сегодня уже создан. Создать ещё один?"
+        else:
+            note = ""
+        await edit_or_send(
+            query,
+            "🗳 Создать опрос в общем чате на ближайший понедельник?" + note,
+            kb([[btn("✅ Создать опрос", "m:pollgo"), btn("❌ Отмена", "m:home")]]),
+        )
+    elif action == "pollgo":
+        try:
+            async with POLL_LOCK:
+                question = await create_game_poll(CHAT_ID, manual=True)
+            await edit_or_send(query, f"✅ Опрос отправлен в общий чат:\n{question}", kb([[btn("⬅️ Меню", "m:home")]]))
+        except Exception as e:
+            await edit_or_send(query, f"❌ Не удалось отправить опрос: {e}", kb([[btn("⬅️ Меню", "m:home")]]))
+    await ack(query)
+
+
+@dp.callback_query(F.data == "noop")
+async def cb_noop(query: types.CallbackQuery):
+    await query.answer("Это действие уже выполнено")
+
+
+# ============================================================
+# Игроки
+# ============================================================
+
+def players_text(data: dict) -> str:
+    lines = [f"👥 Игроки ({len(data['players'])})"]
+    for i, (name, rec) in enumerate(sorted(data["players"].items(), key=lambda kv: norm_key(kv[0])), 1):
+        tags = [f"@{u}" for u in rec["usernames"]] + [f"«{a}»" for a in rec["aliases"]]
+        if not tags:
+            tags = ["без привязки"]
+        lines.append(f"{i}. {name} — {', '.join(tags)}")
+    return "\n".join(lines)
+
+
+def sorted_player_names(data: dict) -> list:
+    return sorted(data["players"], key=norm_key)
+
+
+def players_markup() -> types.InlineKeyboardMarkup:
+    return kb([
+        [btn("➕ Добавить игрока", "pl:add"), btn("🔗 Привязать username", "pl:bind")],
+        [btn("🗑 Удалить игрока", "pl:del"), btn("⬅️ Меню", "m:home")],
+    ])
+
+
+async def show_players(query):
+    try:
+        data = load_players()
+    except DataCorrupted as e:
+        return await report_data_error(e, query=query)
+    await edit_or_send(query, players_text(data), players_markup())
+
+
+def picker_markup(names: list, prefix: str, back: str) -> types.InlineKeyboardMarkup:
+    buttons = [btn(n, f"{prefix}:{i}") for i, n in enumerate(names)]
+    return kb(chunk_rows(buttons, 2) + [[btn("⬅️ Назад", back)]])
+
+
+@dp.callback_query(F.data.startswith("pl:"))
+async def cb_players(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    parts = query.data.split(":")
+    action = parts[1]
+    try:
+        data = load_players()
+        names = sorted_player_names(data)
+        if action == "add":
+            AWAITING[OWNER_ID] = {"kind": "add_player"}
+            await edit_or_send(query, "Отправьте одним сообщением: Фамилия И. @username\n"
+                                      "(username можно не указывать). Отмена — /отмена.",
+                               kb([[btn("⬅️ К игрокам", "m:players")]]))
+        elif action == "bind":
+            await edit_or_send(query, "Кому добавить username?", picker_markup(names, "pl:bp", "m:players"))
+        elif action == "bp":
+            name = names[int(parts[2])]
+            AWAITING[OWNER_ID] = {"kind": "bind_username", "name": name}
+            await edit_or_send(query, f"Отправьте @username для «{name}». Отмена — /отмена.",
+                               kb([[btn("⬅️ К игрокам", "m:players")]]))
+        elif action == "del":
+            await edit_or_send(query, "Кого удалить из списка игроков? (статистика останется)",
+                               picker_markup(names, "pl:dp", "m:players"))
+        elif action == "dp":
+            name = names[int(parts[2])]
+            await edit_or_send(query, f"Удалить «{name}» из списка игроков? Статистика не изменится.",
+                               kb([[btn("✅ Удалить", f"pl:dy:{parts[2]}"), btn("❌ Нет", "m:players")]]))
+        elif action == "dy":
+            name = players_remove(names[int(parts[2])])
+            await edit_or_send(query, f"🗑 «{name}» удалён.\n\n" + players_text(load_players()), players_markup())
+    except DataCorrupted as e:
+        return await report_data_error(e, query=query)
+    except (ValueError, IndexError) as e:
+        await query.message.answer(f"⚠️ {e}")
+    await ack(query)
+
+
+@dp.message(Command("игроки", "players"))
+async def cmd_players(message: types.Message):
+    if not is_owner_private(message):
+        return
+    try:
+        await message.answer(players_text(load_players()), reply_markup=players_markup())
+    except DataCorrupted as e:
+        await report_data_error(e, message=message)
+
+
+PLAYER_USAGE = (
+    "Формат:\n"
+    "/игрок добавить Фамилия И. @username\n"
+    "/игрок удалить Фамилия И.\n"
+    "/игрок username Фамилия И. @новый"
+)
+
+
+def split_name_and_username(text: str):
+    """«Иванов П. @ivanov» → («Иванов П.», «ivanov»); username необязателен."""
+    text = text.strip()
+    m = re.match(r"^(.*?)\s*@([A-Za-z0-9_\-]{3,})$", text)
+    if m and m.group(1).strip():
+        return m.group(1).strip(), m.group(2)
+    return text, None
+
+
+@dp.message(Command("игрок", "player"))
+async def cmd_player(message: types.Message, command: CommandObject):
+    if not is_owner_private(message):
+        return
+    args = (command.args or "").strip()
+    sub, _, rest = args.partition(" ")
+    try:
+        if sub in ("добавить", "add") and rest.strip():
+            name, username = split_name_and_username(rest)
+            name = players_add(name, username)
+            await message.answer(f"✅ Игрок «{name}» добавлен" + (f" (@{username})" if username else "") + ".")
+        elif sub in ("удалить", "remove") and rest.strip():
+            await message.answer(f"🗑 «{players_remove(rest.strip())}» удалён (статистика не тронута).")
+        elif sub in ("username", "юзернейм") and rest.strip():
+            name, username = split_name_and_username(rest)
+            if not username:
+                return await message.answer(PLAYER_USAGE)
+            await message.answer(f"✅ Для «{players_bind(name, username=username)}» добавлен @{username}.")
+        else:
+            await message.answer(PLAYER_USAGE)
+    except DataCorrupted as e:
+        await report_data_error(e, message=message)
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}")
+
+
+@dp.message(Command("привязать", "bind"))
+async def cmd_bind(message: types.Message, command: CommandObject):
+    if not is_owner_private(message):
+        return
+    args = command.args or ""
+    if "=" not in args:
+        return await message.answer("Формат: /привязать @username = Фамилия И.")
+    left, right = [x.strip() for x in args.split("=", 1)]
+    username = clean_username(left)
+    if not username or not right:
+        return await message.answer("Формат: /привязать @username = Фамилия И.")
+    try:
+        name = players_bind(right, username=username)
+        state = load_json(POLL_STATE_FILE, {})
+        changed = False
+        for v in state.get("voters", {}).values():
+            if v.get("username", "").lower() == username.lower() and not v.get("player"):
+                v["player"] = name
+                changed = True
+        if changed:
+            save_json(POLL_STATE_FILE, state)
+        await message.answer(f"✅ @{username} привязан к «{name}».")
+    except DataCorrupted as e:
+        await report_data_error(e, message=message)
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}")
+
+
+@dp.message(F.text, ~F.text.startswith("/"), F.chat.type == "private")
+async def owner_text_input(message: types.Message):
+    """Ответ Дмитрия на вопрос бота (добавить игрока, username, гость, имя)."""
+    if message.from_user.id != OWNER_ID or (message.text or "").startswith("/"):
+        return
+    st = AWAITING.pop(OWNER_ID, None)
+    if not st:
+        return
+    text = message.text.strip()
+    kind = st["kind"]
+    try:
+        if kind == "add_player":
+            name, username = split_name_and_username(text)
+            name = players_add(name, username)
+            await message.answer(f"✅ Игрок «{name}» добавлен.\n\n" + players_text(load_players()), reply_markup=players_markup())
+        elif kind == "bind_username":
+            username = clean_username(text)
+            if not username:
+                raise ValueError("Пустой username.")
+            name = players_bind(st["name"], username=username)
+            await message.answer(f"✅ Для «{name}» добавлен @{username}.", reply_markup=players_markup())
+        elif kind == "new_player_for_voter":
+            voter = load_json(POLL_STATE_FILE, {}).get("voters", {}).get(st["voter"])
+            if not voter:
+                raise ValueError("Этот голос уже не найден в текущем опросе.")
+            name = players_add(text)
+            await bind_voter(st["voter"], name)
+            await message.answer(f"✅ Игрок «{name}» создан и привязан.")
+            await do_split(message.answer)
+        elif kind == "squad_guest":
+            await handle_squad_guest_text(message, st, text)
+    except DataCorrupted as e:
+        await report_data_error(e, message=message)
+    except ValueError as e:
+        AWAITING[OWNER_ID] = st
+        await message.answer(f"⚠️ {e}\nПопробуйте ещё раз или /отмена.")
+
+
+# ============================================================
+# Составы: /разделить, привязка проголосовавших, публикация
+# ============================================================
+
+async def bind_voter(voter_key: str, player_name: str):
+    """Привязывает проголосовавшего к игроку: по ID и username, а если username нет —
+    по отображаемому имени."""
+    state = load_json(POLL_STATE_FILE, {})
+    voter = state.get("voters", {}).get(voter_key)
+    if not voter:
+        raise ValueError("Этот голос уже не найден в текущем опросе.")
+    username = voter.get("username") or None
+    alias = None if username else (voter.get("display") or None)
+    name = players_bind(player_name, username=username, user_id=int(voter_key), alias=alias)
+    voter["player"] = name
+    save_json(POLL_STATE_FILE, state)
+
+
+async def do_split(reply):
+    """Делит проголосовавших «+» и гостей на команды, создаёт новую игру
+    с фактическим составом и присылает черновик с кнопкой публикации."""
+    state = load_json(POLL_STATE_FILE, {})
+    voters = state.get("voters", {})
+    try:
+        pdata = load_players()
+        stats = load_stats()
+    except DataCorrupted as e:
+        return await reply(f"⚠️ Данные недоступны: {e.reason} ({os.path.basename(e.path)}). "
+                           "Составы не сформированы, файл не изменён.")
+    unresolved = []
+    for key, v in voters.items():
+        if not v.get("player"):
+            found = match_player(pdata, int(key), v.get("username", ""), v.get("display", ""))
+            if found:
+                v["player"] = found
+            else:
+                unresolved.append((key, v))
+    if unresolved:
+        save_json(POLL_STATE_FILE, state)
+        rows = [[btn(f"🔗 {v.get('display') or '@' + v.get('username', '?')}", f"vb:{key}")] for key, v in unresolved[:10]]
+        rows.append([btn("⬅️ Меню", "m:home")])
+        names = ", ".join(v.get("display") or ("@" + v.get("username", "")) for _, v in unresolved)
+        return await reply(
+            f"Сначала нужно привязать: {names}\nНажмите на имя — выберите игрока или создайте нового.",
+            reply_markup=kb(rows),
+        )
+    guests = load_json(GUESTS_FILE, [])
+    ratings = {g["name"]: g.get("rating") for g in guests}
+    names, seen = [], set()
+    for n in [v["player"] for v in voters.values()] + [g["name"] for g in guests]:
+        if norm_key(n) not in seen:
+            seen.add(norm_key(n))
+            names.append(n)
+    if len(names) < 2:
+        return await reply("Для деления нужно минимум два игрока.")
+    sp = stats_players_of(stats)
+    koefs, _, _ = koef_for_names(names, ratings, sp)
+    teams, _ = split_teams([(n, koefs[n]) for n in names], team_count_for(len(names)))
+    registered = set(pdata["players"])
+    g = new_game(
+        [[n for n, _ in team] for team in teams],
+        ratings={n: r for n, r in ratings.items() if r},
+        guests=[n for n in names if n not in registered],
+    )
+    previous = load_game()
+    if previous:
+        archive_game(previous)
+    save_game(g)
+    await reply(
+        lineup_text(g, sp),
+        reply_markup=draft_markup(g),
+    )
+
+
+def draft_markup(g: dict, published: bool | None = None) -> types.InlineKeyboardMarkup:
+    if published is None:
+        published = g.get("published_rev") == g["rev"]
+    first = btn("✅ Опубликовано", "noop") if published else btn(
+        "📢 Опубликовать в общий чат" if g.get("published_rev") is None else "📢 Опубликовать обновлённый состав",
+        f"pub:{g['id']}:{g['rev']}")
+    return kb([[first], [btn("⚙️ Изменить состав", "sq:menu"), btn("💰 Оплата", "pm:menu")]])
+
+
+@dp.message(Command("разделить", "split"))
+async def cmd_split_poll(message: types.Message):
+    if not is_owner_private(message):
+        return
+    await do_split(message.answer)
+
+
+@dp.callback_query(F.data.startswith("vb:"))
+async def cb_voter_bind(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    parts = query.data.split(":")
+    try:
+        data = load_players()
+        names = sorted_player_names(data)
+        voter = load_json(POLL_STATE_FILE, {}).get("voters", {}).get(parts[1])
+        if not voter:
+            await query.answer("Голос не найден — повторите /разделить", show_alert=True)
+            return
+        label = voter.get("display") or "@" + voter.get("username", "")
+        if len(parts) == 2:
+            buttons = [btn(n, f"vb:{parts[1]}:{i}") for i, n in enumerate(names)]
+            rows = chunk_rows(buttons, 2) + [[btn("➕ Новый игрок", f"vb:{parts[1]}:new")], [btn("⬅️ Назад", "m:split")]]
+            await edit_or_send(query, f"Кто это: {label}?", kb(rows))
+        elif parts[2] == "new":
+            AWAITING[OWNER_ID] = {"kind": "new_player_for_voter", "voter": parts[1]}
+            await edit_or_send(query, f"Как записать игрока «{label}»? Отправьте: Фамилия И. Отмена — /отмена.")
+        else:
+            name = names[int(parts[2])]
+            await bind_voter(parts[1], name)
+            await edit_or_send(query, f"✅ {label} → «{name}»")
+            await do_split(query.message.answer)
+    except DataCorrupted as e:
+        return await report_data_error(e, query=query)
+    except (ValueError, IndexError) as e:
+        await query.message.answer(f"⚠️ {e}")
+    await ack(query)
+
+
+@dp.message(Command("добавить"))
+async def cmd_add_guest(message: types.Message, command: CommandObject):
+    if message.from_user.id != OWNER_ID or message.chat.type != "private":
+        return
+    if not command.args:
+        return await message.answer("Формат: /добавить Алексей, Максим 2.3")
+    guests = load_json(GUESTS_FILE, [])
+    for part in command.args.split(","):
+        part = part.strip()
+        m = re.match(r"^(.+?)(?:\s+(\d+(?:[.,]\d+)?))?$", part)
+        if m:
+            guests.append({"name": m.group(1).strip(), "rating": float(m.group(2).replace(",", ".")) if m.group(2) else None})
+    save_json(GUESTS_FILE, guests)
+    await message.answer("Добавлены: " + ", ".join(g["name"] for g in guests))
+
+
+@dp.callback_query(F.data == "publish_lineups")
+async def publish_lineups_legacy(query: types.CallbackQuery):
+    """Кнопка из старых черновиков (до обновления): безопасно отказываем."""
+    await query.answer("Эта кнопка устарела. Запустите /split заново.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("pub:"))
+async def cb_publish(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    _, gid, rev_raw = query.data.split(":")
+    rev = int(rev_raw)
+    async with PUBLISH_LOCK:
+        g = load_game()
+        if not g or g["id"] != gid:
+            return await query.answer("Состав устарел. Запустите /split заново.", show_alert=True)
+        if g.get("published_rev") == rev:
+            try:
+                await query.message.edit_reply_markup(reply_markup=draft_markup(g, published=True))
+            except Exception:
+                pass
+            return await query.answer("Уже опубликовано")
+        if rev != g["rev"]:
+            return await query.answer("Состав изменился. Откройте «⚙️ Изменить состав».", show_alert=True)
+        try:
+            stats = load_stats()
+        except DataCorrupted as e:
+            return await report_data_error(e, query=query)
+        text = publish_text(g, stats_players_of(stats))
+        try:
+            await bot.send_message(CHAT_ID, text)
+        except Exception as e:
+            print(f"Не удалось опубликовать составы: {e}")
+            return await query.answer("❌ Не удалось отправить в общий чат. Можно повторить.", show_alert=True)
+        g["published_rev"] = rev
+        g["published_at"] = now_iso()
+        save_game(g)
+        save_json(GUESTS_FILE, [])
+    try:
+        await query.message.edit_reply_markup(reply_markup=draft_markup(g, published=True))
+    except Exception as e:
+        print(f"Не удалось обновить кнопку публикации: {e}")
+    await query.answer("Опубликовано")
+
+
+# ============================================================
+# Изменить фактический состав
+# ============================================================
+
+def squad_markup(g: dict) -> types.InlineKeyboardMarkup:
+    rows = [
+        [btn("➕ Добавить", "sq:adm"), btn("➖ Убрать", "sq:rmm")],
+        [btn("🔄 Заменить", "sq:rpm"), btn("🔁 Пересобрать команды", "sq:rbc")],
+    ]
+    published = g.get("published_rev") == g["rev"]
+    rows.append([btn("✅ Опубликовано", "noop") if published else btn(
+        "📢 Опубликовать обновлённый состав" if g.get("published_rev") is not None else "📢 Опубликовать в общий чат",
+        f"pub:{g['id']}:{g['rev']}")])
+    rows.append([btn("📜 История", "sq:hist"), btn("💰 Оплата", "pm:menu")])
+    rows.append([btn("⚽ Результат", "m:result"), btn("⬅️ Меню", "m:home")])
+    return kb(rows)
+
+
+async def show_squad(query, header: str = ""):
+    g = load_game()
+    if not g:
+        return await edit_or_send(query, "Состава пока нет. Сначала сформируйте его: ⚖️ /разделить.",
+                                  kb([[btn("⚖️ Составы (разделить)", "m:split"), btn("⬅️ Меню", "m:home")]]))
+    try:
+        sp = stats_players_of(load_stats())
+    except DataCorrupted as e:
+        return await report_data_error(e, query=query)
+    g["pending"] = None
+    save_game(g)
+    await edit_or_send(query, squad_text(g, sp, header), squad_markup(g))
+
+
+@dp.message(Command("состав", "squad"))
+async def cmd_squad(message: types.Message):
+    if not is_owner_private(message):
+        return
+    g = load_game()
+    if not g:
+        return await message.answer("Состава пока нет. Сначала сформируйте его: /разделить.")
+    try:
+        sp = stats_players_of(load_stats())
+    except DataCorrupted as e:
+        return await report_data_error(e, message=message)
+    await message.answer(squad_text(g, sp), reply_markup=squad_markup(g))
+
+
+def candidates_for(g: dict, pdata: dict) -> list:
+    return [n for n in sorted_player_names(pdata) if not _find_in_squad(g, n)]
+
+
+def team_buttons(g: dict, sp: dict, prefix: str) -> list:
+    teams, _, _ = teams_with_koef(g, sp)
+    rows = []
+    for i, team in enumerate(teams):
+        avg = sum(k for _, k in team) / len(team) if team else 0
+        rows.append([btn(f"{TEAM_ICONS[i]} В команду {i + 1} ({len(team)} чел., ср. {avg:.2f})", f"{prefix}:{g['rev']}:{i}")])
+    return rows
+
+
+async def after_choose_incoming(target_answer_or_edit, g: dict, sp: dict):
+    """Следующий шаг после выбора нового игрока: куда поставить / каким способом."""
+    pending = g["pending"]
+    who = pending["in"] + (" (гость)" if pending.get("guest") else "")
+    if pending["op"] == "add":
+        rows = team_buttons(g, sp, "sq:at") + [[btn("🔄 Пересобрать команды", f"sq:ar:{g['rev']}")],
+                                               [btn("⬅️ Отмена", "sq:menu")]]
+        text = f"➕ Добавить {who}. В какую команду?"
+    else:
+        rows = [[btn("📌 Поставить на его место", f"sq:mp:{g['rev']}")],
+                [btn("🔄 Пересобрать команды", f"sq:mr:{g['rev']}")],
+                [btn("⬅️ Отмена", "sq:menu")]]
+        text = (f"🔄 Заменить {pending['out']} → {who}.\n\n"
+                "📌 На его место — новичок встаёт в ту же команду, остальные составы не меняются.\n"
+                "🔄 Пересобрать — все команды формируются заново по коэффициентам.")
+    await target_answer_or_edit(text, kb(rows))
+
+
+def parse_guest_text(text: str):
+    m = re.match(r"^(.+?)(?:\s+(\d+(?:[.,]\d+)?))?$", text.strip())
+    if not m or not m.group(1).strip():
+        raise ValueError("Не понял имя. Формат: Имя или Имя 2.3 (рейтинг необязателен).")
+    rating = float(m.group(2).replace(",", ".")) if m.group(2) else None
+    return re.sub(r"\s+", " ", m.group(1).strip()), rating
+
+
+async def handle_squad_guest_text(message, st, text):
+    g = load_game()
+    if not g or g["id"] != st["gid"] or g["rev"] != st["rev"] or not g.get("pending"):
+        raise ValueError("Состав изменился — начните действие заново (⚙️ /состав).")
+    name, rating = parse_guest_text(text)
+    pdata = load_players()
+    sp = stats_players_of(load_stats())
+    canon = resolve_name(name, sp, pdata["players"])
+    if _find_in_squad(g, canon):
+        raise ValueError(f"«{canon}» уже в составе.")
+    guest = not find_key(canon, pdata["players"])
+    g["pending"].update({"in": canon, "rating": rating, "guest": guest})
+    save_game(g)
+    await after_choose_incoming(lambda t, m: message.answer(t, reply_markup=m), g, sp)
+
+
+@dp.callback_query(F.data.startswith("sq:"))
+async def cb_squad(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    parts = query.data.split(":")
+    action = parts[1]
+    g = load_game()
+    if not g:
+        return await query.answer("Состава нет. Запустите /split.", show_alert=True)
+    if action == "menu":
+        await show_squad(query)
+        return await ack(query)
+    try:
+        pdata = load_players()
+        sp = stats_players_of(load_stats())
+    except DataCorrupted as e:
+        return await report_data_error(e, query=query)
+    # все шаги с выбором по индексу несут ревизию: после изменения состава старые кнопки не действуют
+    indexed = {"rm", "ro", "ai", "at", "ar", "mp", "mr", "ag", "rb"}
+    if action in indexed and int(parts[2]) != g["rev"]:
+        await query.answer("Состав уже изменился — откройте заново.", show_alert=True)
+        return await show_squad(query)
+
+    async def edit(text, markup):
+        await edit_or_send(query, text, markup)
+
+    try:
+        if action == "hist":
+            await edit(history_text(g), kb([[btn("⬅️ К составу", "sq:menu")]]))
+        elif action == "rmm":
+            buttons = [btn(f"{TEAM_ICONS[ti]} {n}", f"sq:rm:{g['rev']}:{i}") for i, (ti, n) in enumerate(squad_flat(g))]
+            await edit("Кого убрать из состава (не сможет прийти)?", kb(chunk_rows(buttons, 2) + [[btn("⬅️ Назад", "sq:menu")]]))
+        elif action == "rm":
+            _, name = squad_flat(g)[int(parts[3])]
+            squad_remove(g, name)
+            save_game(g)
+            await show_squad(query, f"➖ {name} убран из состава.")
+        elif action == "adm":
+            g["pending"] = {"op": "add"}
+            save_game(g)
+            names = candidates_for(g, pdata)
+            buttons = [btn(n, f"sq:ai:{g['rev']}:{i}") for i, n in enumerate(names)]
+            rows = chunk_rows(buttons, 2) + [[btn("🧑‍🤝‍🧑 Гость (ввести имя)", f"sq:ag:{g['rev']}")], [btn("⬅️ Назад", "sq:menu")]]
+            await edit("Кого добавить? Выберите игрока или добавьте гостя.", kb(rows))
+        elif action == "rpm":
+            buttons = [btn(f"{TEAM_ICONS[ti]} {n}", f"sq:ro:{g['rev']}:{i}") for i, (ti, n) in enumerate(squad_flat(g))]
+            await edit("Кого заменяем (выбывает)?", kb(chunk_rows(buttons, 2) + [[btn("⬅️ Назад", "sq:menu")]]))
+        elif action == "ro":
+            _, out_name = squad_flat(g)[int(parts[3])]
+            g["pending"] = {"op": "replace", "out": out_name}
+            save_game(g)
+            names = candidates_for(g, pdata)
+            buttons = [btn(n, f"sq:ai:{g['rev']}:{i}") for i, n in enumerate(names)]
+            rows = chunk_rows(buttons, 2) + [[btn("🧑‍🤝‍🧑 Гость (ввести имя)", f"sq:ag:{g['rev']}")], [btn("⬅️ Назад", "sq:menu")]]
+            await edit(f"Вместо {out_name} — кто?", kb(rows))
+        elif action == "ai":
+            if not g.get("pending"):
+                raise ValueError("Начните действие заново.")
+            name = candidates_for(g, pdata)[int(parts[3])]
+            g["pending"].update({"in": name, "rating": None, "guest": False})
+            save_game(g)
+            await after_choose_incoming(edit, g, sp)
+        elif action == "ag":
+            if not g.get("pending"):
+                raise ValueError("Начните действие заново.")
+            AWAITING[OWNER_ID] = {"kind": "squad_guest", "gid": g["id"], "rev": g["rev"]}
+            await edit("Отправьте имя гостя, при желании с рейтингом: Алексей или Алексей 2.3\n"
+                       "Без рейтинга и статистики будет использован средний коэффициент игроков. Отмена — /отмена.",
+                       kb([[btn("⬅️ Назад", "sq:menu")]]))
+        elif action == "at":
+            p = g.get("pending") or {}
+            squad_add(g, p["in"], int(parts[3]), p.get("rating"), p.get("guest", False))
+            g["pending"] = None
+            save_game(g)
+            await show_squad(query, f"➕ {p['in']} добавлен.")
+        elif action == "ar":
+            p = g.get("pending") or {}
+            t = int(min(range(len(g["teams"])), key=lambda i: len(g["teams"][i])))
+            squad_add(g, p["in"], t, p.get("rating"), p.get("guest", False))
+            squad_rebuild(g, sp, reason="add")
+            g["pending"] = None
+            save_game(g)
+            await show_squad(query, f"➕ {p['in']} добавлен, команды пересобраны.")
+        elif action == "mp":
+            p = g.get("pending") or {}
+            squad_replace_in_place(g, p["out"], p["in"], p.get("rating"), p.get("guest", False))
+            g["pending"] = None
+            save_game(g)
+            await show_squad(query, f"🔄 {p['out']} → {p['in']} (на его место, остальные команды не менялись).")
+        elif action == "mr":
+            p = g.get("pending") or {}
+            squad_replace_rebuild(g, p["out"], p["in"], sp, p.get("rating"), p.get("guest", False))
+            g["pending"] = None
+            save_game(g)
+            await show_squad(query, f"🔄 {p['out']} → {p['in']}, команды пересобраны.")
+        elif action == "rbc":
+            await edit("Пересобрать команды заново по коэффициентам? Текущее деление заменится "
+                       "(первоначальный состав и история сохранятся).",
+                       kb([[btn("✅ Да, пересобрать", f"sq:rb:{g['rev']}"), btn("❌ Отмена", "sq:menu")]]))
+        elif action == "rb":
+            squad_rebuild(g, sp, reason="manual")
+            save_game(g)
+            await show_squad(query, "🔁 Команды пересобраны.")
+    except (ValueError, KeyError, IndexError) as e:
+        await query.message.answer(f"⚠️ {e}")
+    await ack(query)
+
+
+# ============================================================
+# Ввод результата матча кнопками
+# ============================================================
+
+def result_list_markup(g: dict) -> types.InlineKeyboardMarkup:
+    res = g["result"]
+    buttons = []
+    for i, n in enumerate(res["roster"]):
+        gl, a = res["g"].get(n, 0), res["a"].get(n, 0)
+        mark = f" {gl}+{a}" if gl or a else ""
+        buttons.append(btn(f"{n}{mark}", f"rs:p:{i}"))
+    rows = chunk_rows(buttons, 2)
+    rows.append([btn("➡️ Далее (проверить)", "rs:prev")])
+    rows.append([btn("❌ Отмена", "rs:cancel")])
+    return kb(rows)
+
+
+def result_list_text(g: dict) -> str:
+    return ("⚽ Внести результат матча\n"
+            f"Фактический состав: {len(g['result']['roster'])} игроков.\n"
+            "Нажмите на игрока, чтобы указать ⚽ голы и 🎯 передачи. У остальных будет 0+0.")
+
+
+def result_preview_text(g: dict) -> str:
+    entries = result_entries(g)
+    scorers = [(n, gl, a) for n, gl, a in entries if gl or a]
+    others = [n for n, gl, a in entries if not gl and not a]
+    lines = ["🔎 Проверьте результат перед записью", ""]
+    lines += [f"• {n} — ⚽ {gl} 🎯 {a}" for n, gl, a in scorers] or ["Голов и передач нет ни у кого."]
+    if others:
+        lines += ["", "Остальные 0+0: " + ", ".join(others)]
+    lines += ["", f"Всего игроков: {len(entries)}. Статистика изменится только после «Записать матч»."]
+    return "\n".join(lines)
+
+
+async def show_result_menu(query):
+    g = load_game()
+    if not g:
+        return await edit_or_send(query, "Состава пока нет. Сначала сформируйте его: /разделить.",
+                                  kb([[btn("⚖️ Составы (разделить)", "m:split"), btn("⬅️ Меню", "m:home")]]))
+    if g.get("result_recorded"):
+        return await edit_or_send(
+            query, "Результат для этого состава уже записан. Исправить можно командой /отменить "
+                   "(убирает последнюю игру) и новым вводом.", kb([[btn("⬅️ Меню", "m:home")]]))
+    if not g.get("result") or set(g["result"]["roster"]) != set(game_players(g)):
+        result_init(g)
+        save_game(g)
+    await edit_or_send(query, result_list_text(g), result_list_markup(g))
+
+
+@dp.message(Command("результат", "result"))
+async def cmd_result(message: types.Message):
+    if not is_owner_private(message):
+        return
+    g = load_game()
+    if not g:
+        return await message.answer("Состава пока нет. Сначала сформируйте его: /разделить.")
+    if g.get("result_recorded"):
+        return await message.answer("Результат для этого состава уже записан. Исправить: /отменить и ввод заново.")
+    if not g.get("result") or set(g["result"]["roster"]) != set(game_players(g)):
+        result_init(g)
+        save_game(g)
+    await message.answer(result_list_text(g), reply_markup=result_list_markup(g))
+
+
+def player_screen(g: dict, idx: int):
+    res = g["result"]
+    n = res["roster"][idx]
+    gl, a = res["g"].get(n, 0), res["a"].get(n, 0)
+    text = f"{n}\n\n⚽ Голы: {gl}\n🎯 Передачи: {a}"
+    markup = kb([
+        [btn("➖ гол", f"rs:g-:{idx}"), btn(f"⚽ {gl}", "noop"), btn("➕ гол", f"rs:g+:{idx}")],
+        [btn("➖ пас", f"rs:a-:{idx}"), btn(f"🎯 {a}", "noop"), btn("➕ пас", f"rs:a+:{idx}")],
+        [btn("⬅️ К списку", "rs:menu")],
+    ])
+    return text, markup
+
+
+@dp.callback_query(F.data.startswith("rs:"))
+async def cb_result(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    parts = query.data.split(":")
+    action = parts[1]
+    g = load_game()
+    if not g or not g.get("result"):
+        await query.answer("Ввод результата устарел. Откройте заново.", show_alert=True)
+        return
+    if g.get("result_recorded") and action != "ok":
+        await query.answer("Результат уже записан.", show_alert=True)
+        return
+    try:
+        if action == "menu":
+            await edit_or_send(query, result_list_text(g), result_list_markup(g))
+        elif action == "p":
+            text, markup = player_screen(g, int(parts[2]))
+            await edit_or_send(query, text, markup)
+        elif action in ("g+", "g-", "a+", "a-"):
+            result_adjust(g, int(parts[2]), "g" if action[0] == "g" else "a", 1 if action[1] == "+" else -1)
+            save_game(g)
+            text, markup = player_screen(g, int(parts[2]))
+            await edit_or_send(query, text, markup)
+        elif action == "prev":
+            await edit_or_send(query, result_preview_text(g), kb([
+                [btn("✅ Записать матч", f"rs:ok:{g['id']}")],
+                [btn("✏️ Изменить", "rs:menu"), btn("❌ Отмена", "rs:cancel")],
+            ]))
+        elif action == "cancel":
+            g["result"] = None
+            save_game(g)
+            await edit_or_send(query, "Ввод результата отменён, статистика не менялась.", kb([[btn("⬅️ Меню", "m:home")]]))
+        elif action == "ok":
+            async with RECORD_LOCK:
+                g = load_game()
+                if not g or g["id"] != parts[2]:
+                    return await query.answer("Состав устарел. Откройте заново.", show_alert=True)
+                if g.get("result_recorded"):
+                    return await query.answer("Результат уже записан.", show_alert=True)
+                if not g.get("result") or set(g["result"]["roster"]) != set(game_players(g)):
+                    return await query.answer("Состав изменился — откройте ввод заново.", show_alert=True)
+                entries = result_entries(g)
+                written = record_match(entries)
+                g["result_recorded"] = True
+                g["recorded_at"] = now_iso()
+                g["recorded"] = [list(w) for w in written]
+                save_game(g)
+            scorers = [f"{n} {gl}+{a}" for n, gl, a in written if gl or a]
+            await edit_or_send(
+                query,
+                f"✅ Матч записан ({len(written)} игроков).\n" + ("Результативные: " + ", ".join(scorers) if scorers else "Голов и передач нет."),
+                kb([[btn("💰 Рассчитать оплату", "pm:menu")], [btn("⬅️ Меню", "m:home")]]),
+            )
+    except DataCorrupted as e:
+        return await report_data_error(e, query=query)
+    except (ValueError, IndexError, KeyError) as e:
+        await query.message.answer(f"⚠️ {e}")
+    await ack(query)
+
+
+# ============================================================
+# Оплата
+# ============================================================
 
 def format_payment(n: int) -> str:
     per_player = calc_payment_per_player(GAME_TOTAL_RUB, n)
@@ -428,11 +2074,61 @@ def format_payment(n: int) -> str:
     )
 
 
+async def show_payment(query):
+    g = load_game()
+    if not g:
+        return await edit_or_send(query, "Фактического состава нет, число игроков неизвестно. "
+                                         "Сформируйте состав (/разделить) или используйте /оплата N.",
+                                  kb([[btn("⬅️ Меню", "m:home")]]))
+    n = len(game_players(g))
+    if n <= 0 or n > 30:
+        return await edit_or_send(query, f"В составе {n} игроков — проверьте состав или используйте /оплата N.",
+                                  kb([[btn("⚙️ Изменить состав", "sq:menu"), btn("⬅️ Меню", "m:home")]]))
+    sent = g.get("payment_rev") == g["rev"]
+    text = (f"💰 Оплата по фактическому составу\n\nИгроков: {n}\n"
+            f"С человека: {calc_payment_per_player(GAME_TOTAL_RUB, n)} ₽\n\n"
+            f"Сообщение для общего чата:\n{format_payment(n)}")
+    first = btn("✅ Отправлено", "noop") if sent else btn("✅ Отправить в общий чат", f"pm:send:{g['id']}:{g['rev']}")
+    await edit_or_send(query, text, kb([[first], [btn("⚙️ Изменить состав", "sq:menu"), btn("⬅️ Меню", "m:home")]]))
+
+
+@dp.callback_query(F.data.startswith("pm:"))
+async def cb_pay_auto(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    parts = query.data.split(":")
+    if parts[1] == "menu":
+        await show_payment(query)
+        return await ack(query)
+    if parts[1] == "send":
+        async with PUBLISH_LOCK:
+            g = load_game()
+            if not g or g["id"] != parts[2]:
+                return await query.answer("Состав устарел. Откройте заново.", show_alert=True)
+            if g.get("payment_rev") == g["rev"]:
+                return await query.answer("Уже отправлено")
+            if int(parts[3]) != g["rev"]:
+                await query.answer("Состав изменился — расчёт обновлён.", show_alert=True)
+                return await show_payment(query)
+            n = len(game_players(g))
+            if n <= 0 or n > 30:
+                return await query.answer("Проверьте число игроков.", show_alert=True)
+            try:
+                await bot.send_message(CHAT_ID, format_payment(n))
+            except Exception as e:
+                print(f"Не удалось отправить оплату: {e}")
+                return await query.answer("❌ Не удалось отправить в общий чат. Можно повторить.", show_alert=True)
+            g["payment_rev"] = g["rev"]
+            g["payment_n"] = n
+            save_game(g)
+        await show_payment(query)
+        await query.answer("Отправлено")
+
+
 # Число игроков нажатием кнопки — команда из меню Telegram (/pay) всегда
 # улетает в чат сразу, БЕЗ аргумента: дописать к ней число с кнопки
-# невозможно, это ограничение самого Telegram, не бага бота. Раньше в
-# таком случае бот просто просил ввести число текстом — с кнопки это
-# было тупиком. Теперь вместо этого показываем готовые варианты.
+# невозможно, это ограничение самого Telegram, не бага бота. Поэтому
+# показываем готовые варианты.
 PAYMENT_QUICK_COUNTS = [12, 13, 14, 15, 16, 17, 18]
 
 
@@ -442,14 +2138,16 @@ async def cmd_payment(message: types.Message, command: CommandObject):
         return
     args = (command.args or "").strip()
     if not args.isdigit() or int(args) <= 0:
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[[
+        rows = [[
             types.InlineKeyboardButton(text=str(n), callback_data=f"pay:{n}")
             for n in PAYMENT_QUICK_COUNTS
-        ]])
+        ]]
+        if is_owner_private(message):
+            rows.insert(0, [btn("💰 По фактическому составу", "pm:menu")])
         await message.answer(
             "Сколько сегодня играло? Нажмите число ниже "
             "или напишите вручную: /оплата N",
-            reply_markup=keyboard,
+            reply_markup=kb(rows),
         )
         return
     n = int(args)
@@ -468,16 +2166,21 @@ async def cmd_payment_callback(query: types.CallbackQuery):
         return await query.answer("Недоступно", show_alert=True)
     n = int(query.data.split(":", 1)[1])
     await query.message.answer(format_payment(n))
-    await query.answer()
+    await ack(query)
 
 
-@dp.message(Command("статистика", "stats"))
-async def cmd_stats(message: types.Message):
-    if not is_allowed(message, "статистика"):
-        return
-    chat_stats = load_stats().get(str(target_chat(message)), {}).get("players", {})
+# ============================================================
+# Статистика и прочие текстовые команды
+# ============================================================
+
+async def send_stats(answer):
+    try:
+        chat_stats = stats_players_of(load_stats())
+    except DataCorrupted as e:
+        print(f"[DATA ERROR] {e}")
+        return await answer("⚠️ Статистика сейчас недоступна (файл не читается). Администратор уведомлён.")
     if not chat_stats:
-        await message.answer("Статистики пока нет.\nДобавьте игру: /матч Иванов 2+1")
+        await answer("Статистики пока нет.\nДобавьте игру: /матч Иванов 2+1")
         return
     rows = [(koef_of(r), points_of(r), name, r) for name, r in chat_stats.items()]
     rows.sort(reverse=True)
@@ -488,9 +2191,50 @@ async def cmd_stats(message: types.Message):
     ]
     for i, (koef, pts, name, r) in enumerate(rows, 1):
         lines.append(
-            f"{i}. {name} — И:{r['games']} Г:{r['goals']} П:{r['assists']} "
+            f"{i}. {name} — И:{r.get('games', 0)} Г:{r.get('goals', 0)} П:{r.get('assists', 0)} "
             f"О:{fmt_num(pts)} К:{koef:.2f}"
         )
+    await answer("\n".join(lines))
+
+
+@dp.message(Command("статистика", "stats"))
+async def cmd_stats(message: types.Message):
+    if not is_allowed(message, "статистика"):
+        return
+    try:
+        load_stats()
+    except DataCorrupted as e:
+        await report_data_error(e, message=message)
+        return
+    await send_stats(message.answer)
+
+
+@dp.message(Command("матч"))
+async def cmd_match(message: types.Message, command: CommandObject):
+    if not is_allowed(message, "матч"):
+        return
+    usage = (
+        "Формат:\n"
+        "/матч Иванов 2+1, Петров 0+3, Соломин\n\n"
+        "Гол = 2 очка, пас = 1 очко."
+    )
+    if not command.args:
+        await message.answer(usage)
+        return
+    players, errors = parse_match_line(command.args)
+    if not players:
+        await message.answer(f"Не понял игроков.\n{usage}")
+        return
+    try:
+        written = record_match(players)
+    except DataCorrupted as e:
+        await report_data_error(e, message=message)
+        return
+    lines = [f"Записал игру ({len(written)} чел.):"]
+    for name, g, a in written:
+        lines.append(f"• {name}: {g}+{a}")
+    if errors:
+        lines.append(f"\nНе разобрал: {', '.join(errors)}")
     await message.answer("\n".join(lines))
 
 
@@ -498,23 +2242,28 @@ async def cmd_stats(message: types.Message):
 async def cmd_undo(message: types.Message):
     if not is_allowed(message, "отменить"):
         return
-    stats = load_stats()
-    chat = stats.setdefault(str(target_chat(message)), {"players": {}, "last": []})
-    last = chat.get("last") or []
-    if not last:
-        await message.answer("Нечего отменять.")
+    try:
+        stats = load_stats()
+        chat = stats.setdefault(str(target_chat(message)), {"players": {}, "last": []})
+        last = chat.get("last") or []
+        if not last:
+            await message.answer("Нечего отменять.")
+            return
+        for name, goals, assists in last:
+            key = find_key(name, chat["players"])
+            rec = chat["players"].get(key) if key else None
+            if not rec:
+                continue
+            rec["games"] = max(0, rec.get("games", 0) - 1)
+            rec["goals"] = max(0, rec.get("goals", 0) - goals)
+            rec["assists"] = max(0, rec.get("assists", 0) - assists)
+            if rec["games"] == 0 and rec["goals"] == 0 and rec["assists"] == 0:
+                chat["players"].pop(key, None)
+        chat["last"] = []
+        save_stats(stats)
+    except DataCorrupted as e:
+        await report_data_error(e, message=message)
         return
-    for name, goals, assists in last:
-        rec = chat["players"].get(name)
-        if not rec:
-            continue
-        rec["games"] = max(0, rec["games"] - 1)
-        rec["goals"] = max(0, rec["goals"] - goals)
-        rec["assists"] = max(0, rec["assists"] - assists)
-        if rec["games"] == 0 and rec["goals"] == 0 and rec["assists"] == 0:
-            chat["players"].pop(name, None)
-    chat["last"] = []
-    save_stats(stats)
     await message.answer(f"Последняя игра отменена: {', '.join(p[0] for p in last)}")
 
 
@@ -525,20 +2274,27 @@ async def cmd_rename(message: types.Message, command: CommandObject):
     if not command.args or "=" not in command.args:
         await message.answer("Формат: /переименовать Старое = Новое")
         return
-    old, new = [x.strip().title() for x in command.args.split("=", 1)]
-    stats = load_stats()
-    chat = stats.setdefault(str(target_chat(message)), {"players": {}, "last": []})
-    rec = chat["players"].pop(old, None)
-    if rec is None:
-        await message.answer(f"Игрока «{old}» нет.")
+    old_raw, new_raw = [x.strip() for x in command.args.split("=", 1)]
+    try:
+        stats = load_stats()
+        chat = stats.setdefault(str(target_chat(message)), {"players": {}, "last": []})
+        old = find_key(old_raw, chat["players"])
+        if old is None:
+            await message.answer(f"Игрока «{old_raw.title()}» нет.")
+            return
+        registered = set(load_players()["players"])
+        new = resolve_name(new_raw, chat["players"], registered)
+        rec = chat["players"].pop(old)
+        target = chat["players"].setdefault(new, {"games": 0, "goals": 0, "assists": 0})
+        for k in ("games", "goals", "assists"):
+            target[k] = target.get(k, 0) + rec.get(k, 0)
+        for entry in chat.get("last", []):
+            if entry[0] == old:
+                entry[0] = new
+        save_stats(stats)
+    except DataCorrupted as e:
+        await report_data_error(e, message=message)
         return
-    target = chat["players"].setdefault(new, {"games": 0, "goals": 0, "assists": 0})
-    for k in ("games", "goals", "assists"):
-        target[k] += rec[k]
-    for entry in chat.get("last", []):
-        if entry[0] == old:
-            entry[0] = new
-    save_stats(stats)
     await message.answer(f"«{old}» → «{new}»")
 
 
@@ -549,9 +2305,13 @@ async def cmd_reset(message: types.Message, command: CommandObject):
     if (command.args or "").strip().lower() != "да":
         await message.answer("Чтобы стереть статистику, напишите:\n/обнулить да")
         return
-    stats = load_stats()
-    stats.pop(str(target_chat(message)), None)
-    save_stats(stats)
+    try:
+        stats = load_stats()
+        stats.pop(str(target_chat(message)), None)
+        save_stats(stats)
+    except DataCorrupted as e:
+        await report_data_error(e, message=message)
+        return
     await message.answer("Статистика очищена.")
 
 
@@ -575,122 +2335,138 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
     if not names:
         await message.answer(usage)
         return
-    chat_players = load_stats().get(str(target_chat(message)), {}).get("players", {})
-    known_koefs = [koef_of(chat_players[n]) for n in names if n in chat_players and chat_players[n].get("games")]
-    fallback = sum(known_koefs) / len(known_koefs) if known_koefs else 1.0
-    players = []
-    unknown = []
-    for name in names:
-        rec = chat_players.get(name)
-        if rec and rec.get("games"):
-            koef = koef_of(rec)
-        else:
-            koef = fallback
-            unknown.append(name)
-        players.append((name, koef))
+    try:
+        chat_players = stats_players_of(load_stats())
+    except DataCorrupted as e:
+        await report_data_error(e, message=message)
+        return
+    koefs, unknown, fallback = koef_for_names(names, {}, chat_players)
+    players = [(n, koefs[n]) for n in names]
     team_count = team_count_for(len(players))
     teams, spread = split_teams(players, team_count)
-    lines = [f"⚖️ Составы — {len(players)} игроков, {team_count} команды\n"]
-    for i, team in enumerate(teams, 1):
-        avg = sum(k for _, k in team) / len(team) if team else 0
-        lines.append(f"{('⚪', '⚫', '🔴')[i - 1]} Команда {i} ({('белые', 'чёрные', 'красные')[i - 1]}) (средний коэф. {avg:.2f}):")
-        lines += [f"• {n} — {k:.2f}" for n, k in team]
-        lines.append("")
-    if unknown:
-        lines.append(f"Без статистики (коэф. {fallback:.2f} — среднее по остальным): {', '.join(unknown)}")
-    await message.answer("\n".join(lines).strip())
-
-
-async def create_game_poll(chat_id: int):
-    now = datetime.datetime.now(YEKB_TZ)
-    today = now.date()
-    days_until_monday = (7 - today.weekday()) % 7
-    if days_until_monday == 0:
-        days_until_monday = 7
-    monday = today + datetime.timedelta(days=days_until_monday)
-    question = f"Футбол Лестех понедельник {monday.strftime('%d.%m.%Y')} {GAME_TIME}"
-    poll_message = await bot.send_poll(
-        chat_id=chat_id,
-        question=question,
-        options=["+", "-"],
-        is_anonymous=False,
-    )
-    with open(LAST_POLL_FILE, "w") as f:
-        f.write(today.isoformat())
-    save_json(POLL_STATE_FILE, {
-        "poll_id": poll_message.poll.id,
-        "message_id": poll_message.message_id,
-        "date": today.isoformat(),
-        "voters": {},
-    })
-    print(f"Опрос отправлен: {question}")
-    return question
+    await message.answer(format_lineups(teams, unknown, fallback))
 
 
 @dp.message(Command("опрос", "poll"))
-async def cmd_poll(message: types.Message):
+async def cmd_poll(message: types.Message, command: CommandObject):
     if not message.from_user or message.from_user.id != OWNER_ID:
         return
+    today = datetime.datetime.now(YEKB_TZ).date()
+    if poll_done_today(today) and (command.args or "").strip().lower() != "да":
+        await message.answer("Опрос на сегодня уже создан. Чтобы создать ещё один, напишите: /опрос да")
+        return
     try:
-        question = await create_game_poll(CHAT_ID)
+        async with POLL_LOCK:
+            question = await create_game_poll(CHAT_ID, manual=True)
         if message.chat.id != CHAT_ID:
             await message.answer(f"Опрос отправлен в общий чат: {question}")
     except Exception as e:
         await message.answer(f"Не удалось отправить опрос: {e}")
 
 
-async def maybe_send_poll():
-    now = datetime.datetime.now(YEKB_TZ)
-    if now.weekday() != 5:  # суббота
-        return
-    # При перезапуске в течение часа всё равно отправим опрос, но не раньше 12:00.
-    if now.hour != 12:
-        return
-    today = now.date()
-    last = None
-    if os.path.exists(LAST_POLL_FILE):
-        try:
-            with open(LAST_POLL_FILE) as f:
-                last = datetime.date.fromisoformat(f.read().strip())
-        except Exception:
-            pass
-    if last == today:
-        return
+# ============================================================
+# Меню команд, запуск
+# ============================================================
+
+OWNER_MENU_COMMANDS = [
+    ("menu", "Панель администратора"),
+    ("poll", "Создать опрос в общем чате"),
+    ("split", "Разделить выбравших + на составы"),
+    ("squad", "Изменить фактический состав"),
+    ("result", "Внести результат матча"),
+    ("pay", "Рассчитать оплату"),
+    ("stats", "Показать статистику"),
+    ("players", "Игроки и привязки"),
+    ("help", "Help — инструкция администратора"),
+]
+
+
+async def setup_menu() -> dict:
+    """Меню команд («Функции») — только в личном чате владельца. Сначала
+    очищаются default/группы/личные/админские/чат-scope (и языковые
+    варианты), иначе Telegram показывал бы старое меню через fallback."""
+    report = {"before_button": "?", "after_button": "?", "counts": {}, "errors": []}
     try:
-        await create_game_poll(CHAT_ID)
+        report["before_button"] = (await bot.get_chat_menu_button()).type
     except Exception as e:
-        print(f"Ошибка отправки опроса: {e}")
+        report["errors"].append(f"get_chat_menu_button: {e}")
+    scopes = {
+        "default": types.BotCommandScopeDefault(),
+        "groups": types.BotCommandScopeAllGroupChats(),
+        "private": types.BotCommandScopeAllPrivateChats(),
+        "admins": types.BotCommandScopeAllChatAdministrators(),
+        "chat": types.BotCommandScopeChat(chat_id=CHAT_ID),
+    }
+    for label, scope in scopes.items():
+        for lang in (None, "ru", "en"):
+            try:
+                await bot.delete_my_commands(scope=scope, language_code=lang)
+            except Exception as e:
+                report["errors"].append(f"delete {label}/{lang}: {e}")
+    owner_scope = types.BotCommandScopeChat(chat_id=OWNER_ID)
+    try:
+        await bot.set_my_commands(
+            [types.BotCommand(command=c, description=d) for c, d in OWNER_MENU_COMMANDS],
+            scope=owner_scope,
+        )
+    except Exception as e:
+        report["errors"].append(f"set owner: {e}")
+    try:
+        await bot.set_chat_menu_button(menu_button=types.MenuButtonDefault())
+        await bot.set_chat_menu_button(chat_id=OWNER_ID, menu_button=types.MenuButtonCommands())
+        report["after_button"] = (await bot.get_chat_menu_button()).type
+    except Exception as e:
+        report["errors"].append(f"menu button: {e}")
+    checks = dict(scopes)
+    checks["owner"] = owner_scope
+    for label, scope in checks.items():
+        try:
+            report["counts"][label] = len(await bot.get_my_commands(scope=scope))
+        except Exception as e:
+            report["errors"].append(f"get {label}: {e}")
+    print(f"[MENU] {report}")
+    return report
 
 
-async def poll_scheduler():
-    """Раз в минуту проверяет, не пора ли отправить опрос.
+def storage_report() -> list:
+    lines = []
+    try:
+        stats = load_stats()
+        backup_file(STATS_FILE, "stats")
+        lines.append(f"📊 Статистика: OK, игроков {len(stats_players_of(stats))}")
+    except DataCorrupted as e:
+        lines.append(f"⚠️ Статистика НЕ читается ({e.reason}) — изменения статистики остановлены, файл не тронут")
+    try:
+        data = load_players()
+        lines.append(f"👥 Игроки: OK, {len(data['players'])}")
+    except DataCorrupted as e:
+        lines.append(f"⚠️ Игроки НЕ читаются ({e.reason})")
+    return lines
 
-    17.09.2026: процесс формально не падал (событий рестарта не было),
-    но кнопки меню не отвечали почти сутки — а в логах за это время не
-    было ни строчки, потому что бот и так почти ничего не печатает.
-    Понять по логам, жив ли цикл, было невозможно. Теперь раз в
-    ~30 минут пишем простое "сердцебиение" — не чинит зависание само по
-    себе, но хотя бы видно в getRunLogs, что цикл ещё тикает, не
-    дожидаясь, пока кто-то заметит неотвечающие кнопки."""
-    tick = 0
-    print(f"[DEBUG] планировщик опроса запущен {datetime.datetime.now(YEKB_TZ):%d.%m.%Y %H:%M}")
-    while True:
-        await maybe_send_poll()
-        tick += 1
-        if tick % 30 == 0:
-            print(f"[DEBUG] планировщик жив, тик {tick}, {datetime.datetime.now(YEKB_TZ):%d.%m.%Y %H:%M}")
-        await asyncio.sleep(60)
+
+async def notify_started(menu: dict):
+    counts = menu.get("counts", {})
+    hidden = all(counts.get(k, 0) == 0 for k in ("default", "groups", "private", "admins", "chat"))
+    lines = [
+        f"🟢 Мяч запущен · версия {BOT_VERSION}",
+        *storage_report(),
+        f"📋 Меню: у вас {counts.get('owner', '?')} команд, в общем чате и у остальных "
+        + ("скрыто ✅" if hidden else f"НЕ скрыто ⚠️ {counts}"),
+        f"🔘 Кнопка меню до настройки: {menu.get('before_button')}, после: {menu.get('after_button')}",
+    ]
+    if menu.get("errors"):
+        lines.append("Замечания: " + "; ".join(menu["errors"][:3]))
+    lines.append("\nПанель: /menu · Инструкция: /help")
+    try:
+        await bot.send_message(OWNER_ID, "\n".join(lines))
+    except Exception as e:
+        print(f"Не удалось отправить стартовое сообщение: {e}")
 
 
 async def main():
-    print(f"Постоянный запуск бота {datetime.datetime.now(YEKB_TZ)}")
-    await bot.set_my_commands([
-        types.BotCommand(command="poll", description="Создать опрос в общем чате"),
-        types.BotCommand(command="split", description="Разделить выбравших + на составы"),
-        types.BotCommand(command="stats", description="Показать статистику"),
-        types.BotCommand(command="pay", description="Рассчитать оплату"),
-        types.BotCommand(command="help", description="Список команд"),
-    ])
+    print(f"Постоянный запуск бота {datetime.datetime.now(YEKB_TZ)} версия {BOT_VERSION}")
+    menu = await setup_menu()
+    await notify_started(menu)
     scheduler = asyncio.create_task(poll_scheduler())
     try:
         await dp.start_polling(bot)
