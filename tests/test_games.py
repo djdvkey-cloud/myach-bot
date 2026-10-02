@@ -78,26 +78,135 @@ class Numbering(GamesBase):
         self.assertIn("Записал игру (2 чел.)", m.answers[-1][0])
         self.assertIn("Игра №5 — ", m.answers[-1][0])
 
-    async def test_undo_annuls_last_new_game_and_frees_number_but_never_historical(self):
+    async def test_undo_keeps_number_correction_reuses_it_next_evening_gets_6(self):
         self.setup_roster()
-        _, g5 = self.record()
+        # 1. Игра №5 записана (с ошибочными данными)
+        wrong = {"Иванов И.": (9, 9), "Петров П.": (0, 0), "Сидоров С.": (0, 0)}
+        _, g5 = self.record(scores=wrong, date="2026-10-05")
+        self.assertEqual(g5["number"], 5)
+        stats_with_wrong = self.read_stats()[str(CHAT)]["players"]["Иванов И."]
+        self.assertEqual((stats_with_wrong["goals"], stats_with_wrong["games"]), (18, 5))
+        # 2. Данные отменены (/отменить)
         m = owner_msg()
         await B.cmd_undo(m)
-        self.assertIn("Игра №5 аннулирована", m.answers[-1][0])
-        self.assertEqual(B.played_games_count(), 4)
-        self.assertEqual(B.load_games()["annulled"][0]["number"], 5)
-        _, again = self.record()
+        self.assertIn("Игра №5 остаётся за этим вечером", m.answers[-1][0])
+        self.assertIn("не освобождается", m.answers[-1][0])
+        ivan = self.read_stats()[str(CHAT)]["players"]["Иванов И."]
+        self.assertEqual((ivan["goals"], ivan["games"]), (9, 4))                     # статистика откатилась
+        games = B.load_games()
+        g = [x for x in games["games"] if x["number"] == 5][0]
+        self.assertEqual((g["status"], g["date"], g["teams"]), ("reverted", "2026-10-05", None))
+        self.assertIsNotNone(g["teams_before_undo"])                                   # прежние данные не потеряны (аудит)
+        self.assertEqual(B.played_games_count(), 5)                                    # номер за этим вечером сохранён
+        # 3. Повторная запись исправленных данных этого же вечера — снова Игра №5
+        _, again = self.record(scores={"Иванов И.": (2, 1), "Петров П.": (0, 2), "Сидоров С.": (1, 0)}, date="2026-10-06")
         self.assertEqual(again["number"], 5)
-        # без новых игр /отменить откатывает статистику, но историческая игра остаётся
+        self.assertEqual(again["date"], "2026-10-05")                                  # дата вечера прежняя
+        self.assertNotIn("status", again)
+        games = B.load_games()
+        self.assertEqual(sorted(x["number"] for x in games["games"]), [1, 2, 3, 4, 5])  # дубля игры нет
+        ivan = self.read_stats()[str(CHAT)]["players"]["Иванов И."]
+        self.assertEqual((ivan["goals"], ivan["games"]), (11, 5))                      # ровно одна запись игры №5
+        # 4. Следующий новый состоявшийся вечер — Игра №6
+        _, g6 = self.record(date="2026-10-12")
+        self.assertEqual(g6["number"], 6)
+        # 5. №5 никогда не переиспользуется
+        self.assertEqual([x["date"] for x in B.load_games()["games"] if x["number"] == 5], ["2026-10-05"])
+
+    async def test_number_not_reused_by_a_different_evening_after_undo(self):
+        self.setup_roster()
+        _, g5 = self.record(date="2026-10-05")
+        await B.cmd_undo(owner_msg())                          # данные игры №5 отменены и так и не введены заново
+        # через неделю — другой футбольный вечер: он обязан получить №6, а не вернуть №5
+        _, other = self.record(date="2026-10-12")
+        self.assertEqual(other["number"], 6)
+        games = B.load_games()["games"]
+        five = [x for x in games if x["number"] == 5][0]
+        self.assertEqual((five["status"], five["date"]), ("reverted", "2026-10-05"))   # №5 остаётся за вечером 05.10
+        self.assertEqual(B.next_game_number(B.load_games()), 7)
+        numbers = [x["number"] for x in games]
+        self.assertEqual(len(numbers), len(set(numbers)))
+
+    async def test_reentry_window_is_shorter_than_a_week(self):
+        self.setup_roster()
+        self.record(date="2026-10-05")
+        await B.cmd_undo(owner_msg())
+        _, same_week = self.record(date="2026-10-08")          # 3 дня — исправление того же вечера
+        self.assertEqual(same_week["number"], 5)
+        await B.cmd_undo(owner_msg())
+        _, next_week = self.record(date="2026-10-12")          # 7 дней — новый вечер
+        self.assertEqual(next_week["number"], 6)
+
+    async def test_undo_twice_and_historical_games_untouched(self):
+        self.setup_roster()
+        self.record()
+        m = owner_msg()
+        await B.cmd_undo(m)
+        await B.cmd_undo(m)
+        self.assertIn("Нечего отменять", m.answers[-1][0])
+        self.assertEqual(B.played_games_count(), 5)
+        # только игры №1–4 и данные «последней игры» в статистике: историческая игра остаётся без изменений
+        games = B.load_games()
+        for g in games["games"]:
+            if g["number"] <= 4:
+                self.assertIsNone(g["teams"])
+                self.assertNotIn("status", g)
         self.write_stats({"Иванов И.": {"games": 4, "goals": 1, "assists": 0}}, last=[["Иванов И.", 1, 0]])
         games = B.load_games()
-        B.annul_last_game(games)                                  # №5 снова
+        games["games"] = [g for g in games["games"] if g["number"] <= 4]
         B.save_games(games)
-        self.write_stats({"Иванов И.": {"games": 4, "goals": 1, "assists": 0}}, last=[["Иванов И.", 1, 0]])
         m2 = owner_msg()
         await B.cmd_undo(m2)
+        self.assertNotIn("остаётся за этим вечером", m2.answers[-1][0])
         self.assertEqual(B.played_games_count(), 4)
-        self.assertNotIn("аннулирована", m2.answers[-1][0])
+
+    async def test_buttons_flow_can_be_reentered_after_undo_with_same_number(self):
+        self.setup_roster()
+        g = B.new_game([["Иванов И.", "Сидоров С."], ["Петров П."]])
+        B.save_game(g)
+        await B.cb_panel(FakeQuery("m:result"))
+        await B.cb_result(FakeQuery("rs:g+:0"))
+
+        async def confirm():
+            q = FakeQuery("rs:prev")
+            await B.cb_result(q)
+            ok = [d for d in all_button_data(q.message.edits[-1][1]) if d.startswith("rs:ok")][0]
+            q = FakeQuery(ok)
+            await B.cb_result(q)
+            return q.message.edits[-1][0]
+
+        first = await confirm()
+        self.assertIn("Игра №5", first)
+        await B.cmd_undo(owner_msg())
+        self.assertFalse(B.load_game()["result_recorded"])                              # можно вводить заново той же кнопкой
+        await B.cb_panel(FakeQuery("m:result"))
+        await B.cb_result(FakeQuery("rs:g+:1"))
+        second = await confirm()
+        self.assertIn("Игра №5", second)
+        self.assertEqual(B.played_games_count(), 5)
+
+    async def test_history_marks_reverted_game_and_keeps_number(self):
+        self.setup_roster()
+        self.record()
+        await B.cmd_undo(owner_msg())
+        text, markup = B.history_list_view(B.load_games(), 0)
+        self.assertIn("Игра №5 — 05.10.2026 ⚠️", text)
+        q = FakeQuery("gh:g:5")
+        await B.cb_history(q)
+        self.assertIn("Данные этой игры отменены", q.message.edits[-1][0])
+        self.assertIn("Игра №5", q.message.edits[-1][0])
+
+    def test_legacy_annulled_game_comes_back_and_number_not_reused(self):
+        """Файл версии 2026-10-02: игра №5 лежала в annulled — теперь номер сохранён за ней."""
+        games = B.load_games()
+        games["annulled"].append({"number": 5, "date": "2026-10-05", "teams": [[{"name": "А", "pid": None, "goals": 1, "assists": 0}]],
+                                  "split": True, "source": "result", "annulled_at": "2026-10-06T10:00:00"})
+        B.save_json(B.GAMES_FILE, games)
+        loaded = B.load_games()
+        five = [g for g in loaded["games"] if g["number"] == 5][0]
+        self.assertEqual((five["status"], loaded["annulled"]), ("reverted", []))
+        self.assertEqual(B.next_game_number(loaded), 6)
+        self.assertEqual(B.next_game_number({"games": [], "annulled": [{"number": 7}]}), 8)
 
     def test_game_after_midnight_belongs_to_previous_evening(self):
         self.set_now(real_dt.datetime(2026, 10, 13, 0, 40))

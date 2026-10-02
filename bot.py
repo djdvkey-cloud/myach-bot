@@ -21,7 +21,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.client.session.aiohttp import AiohttpSession
 
-BOT_VERSION = "2026-10-02"
+BOT_VERSION = "2026-10-03"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -45,6 +45,9 @@ BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 GAMES_FILE = os.path.join(DATA_DIR, "games.json")        # журнал состоявшихся игр (футбольных вечеров) с постоянными номерами
 # Состоявшиеся игры №1–4: даты заданы Дмитрием. Составы и голы этих игр в проекте не сохранялись — не придумываются.
 HISTORICAL_GAMES = [(1, "2026-09-07"), (2, "2026-09-14"), (3, "2026-09-21"), (4, "2026-09-28")]
+# После /отменить игра сохраняет свой номер; исправленные данные того же вечера (в течение этих дней) получают тот же номер.
+# Следующий футбольный вечер — через 7 дней, поэтому окно короче недели.
+REENTRY_DAYS = 3
 BACKUP_KEEP = 40
 
 # Начальный список игроков. Используется ТОЛЬКО для первого создания
@@ -388,6 +391,19 @@ def load_games() -> dict:
     except ValueError as e:
         raise DataCorrupted(GAMES_FILE, str(e))
     data.setdefault("annulled", [])
+    if data["annulled"]:
+        # Совместимость с версией 2026-10-02 (там /отменить убирал игру из журнала): номер возвращается как «отменённые данные».
+        for old in data["annulled"]:
+            back = {k: v for k, v in old.items() if k != "annulled_at"}
+            back["teams_before_undo"], back["teams"], back["status"] = back.get("teams"), None, "reverted"
+            if all(g["number"] != back["number"] for g in data["games"]):
+                data["games"].append(back)
+        data["annulled"] = []
+        data["games"].sort(key=lambda g: g["number"])
+        try:
+            save_games(data)
+        except Exception as e:
+            print(f"Не удалось сохранить журнал игр после миграции: {e}")
     return data
 
 
@@ -403,7 +419,21 @@ def played_games_count() -> int:
 
 
 def next_game_number(data: dict) -> int:
-    return max((g["number"] for g in data["games"]), default=0) + 1
+    """Новый номер — всегда больше любого уже выданного (в том числе у игры с отменёнными данными): номера не переиспользуются."""
+    used = [g["number"] for g in data["games"]] + [g["number"] for g in data.get("annulled", [])]
+    return max(used, default=0) + 1
+
+
+def reentry_target(games: dict, day: str):
+    """Игра, чьи данные отменены /отменить и которую теперь вводят заново (исправление того же вечера) — сохраняет свой номер.
+    Только самая последняя игра и только в пределах REENTRY_DAYS от её даты; иначе это уже другой вечер."""
+    if not games["games"]:
+        return None
+    last = max(games["games"], key=lambda g: g["number"])
+    if last.get("status") != "reverted":
+        return None
+    delta = (datetime.date.fromisoformat(day) - datetime.date.fromisoformat(last["date"])).days
+    return last if 0 <= delta <= REENTRY_DAYS else None
 
 
 def game_date_now() -> str:
@@ -483,9 +513,17 @@ def record_match_full(players: list, teams=None, date: str | None = None):
     try:
         split = bool(teams)
         game_teams = build_game_teams(teams if split else [[n for n, _, _ in written]], written, registry)
-        game = {"number": next_game_number(games), "date": date or game_date_now(), "teams": game_teams,
-                "split": split, "source": "result" if split else "text", "recorded_at": now_iso()}
-        games["games"].append(game)
+        day = date or game_date_now()
+        game = reentry_target(games, day)
+        fields = {"teams": game_teams, "split": split, "source": "result" if split else "text", "recorded_at": now_iso()}
+        if game is not None:                    # исправленный ввод той же игры: прежний номер и дата
+            for key in ("status", "reverted_at", "teams_before_undo"):
+                game.pop(key, None)
+            game.update(fields)
+            game["reentered_at"] = now_iso()
+        else:
+            game = {"number": next_game_number(games), "date": day, **fields}
+            games["games"].append(game)
         save_games(games)
     except BaseException:
         _restore_bytes(snapshot)
@@ -497,16 +535,18 @@ def record_match(players: list, teams=None, date: str | None = None) -> list:
     return record_match_full(players, teams, date)[0]
 
 
-def annul_last_game(games: dict):
-    """Отмена последней записанной игры (/отменить): номер освобождается только для самой последней игры,
-    запись остаётся в games["annulled"] для аудита. Прежние игры №1–4 (historical) не аннулируются."""
-    if not games["games"]:
+def revert_last_game(games: dict):
+    """/отменить: статистика откатывается, а игра ОСТАЁТСЯ в журнале со своим номером (status = reverted, данные убраны).
+    Номер больше никому не выдаётся: исправленный ввод того же вечера вернёт тот же номер (см. reentry_target).
+    Затрагивается только самая последняя игра; №1–4 (historical) данных не имеют и не меняются."""
+    candidates = [g for g in games["games"] if g.get("source") != "historical" and g.get("status") != "reverted"]
+    if not candidates:
         return None
-    last = max(games["games"], key=lambda g: g["number"])
-    if last.get("source") == "historical":
+    last = max(candidates, key=lambda g: g["number"])
+    if last["number"] != max(g["number"] for g in games["games"]):
         return None
-    games["games"].remove(last)
-    games["annulled"].append({**last, "annulled_at": now_iso()})
+    last["teams_before_undo"], last["teams"] = last.get("teams"), None
+    last["status"], last["reverted_at"] = "reverted", now_iso()
     return last
 
 
@@ -1355,7 +1395,9 @@ HELP_SECTIONS = {
         "цифр записывается как 0+0. Эта команда доступна и участникам общего чата.\n\n"
         "Каждая записанная игра (весь футбольный вечер) получает постоянный номер: «Игра №5 — 12.10.2026». Номер "
         "дают только фактически записанному вечеру; отменённый вечер не нумеруется. История игр — «📚 История игр» (/история).\n"
-        "Отмена: /отменить убирает последнюю записанную игру (одну) и освобождает её номер; игры №1–4 номер не теряют.\n\n"
+        "Отмена: /отменить убирает последнюю записанную игру (одну): статистика откатывается, но НОМЕР игры остаётся за этим вечером и никогда не переиспользуется. "
+        "Если данные вечера исправляют — введите их заново (в течение 3 дней): запишется та же Игра №N. "
+        "Следующий новый вечер получит следующий номер.\n\n"
         "Ограничения: результат одного состава записывается один раз — повтор блокируется; если состав "
         "изменился, ввод идёт уже по новому. Гость после записи попадает в статистику под своим именем; "
         "регистр и «ё/е» не создают дублей."
@@ -1827,6 +1869,10 @@ def game_view_text(game: dict, registry: dict) -> str:
     """Архив конкретной игры: составы и голы/передачи каждого именно в этой игре. Без счёта матчей и общей статистики."""
     lines = [f"⚽ {game_title(game)}", ""]
     teams = game.get("teams")
+    if game.get("status") == "reverted":
+        lines.append(f"⚠️ Данные этой игры отменены (/отменить). Номер сохранён за этим вечером; "
+                     f"исправленный ввод запишется как Игра №{game['number']}.")
+        return "\n".join(lines)
     if not teams:
         lines.append("Составы и индивидуальная статистика этой игры не сохранялись (игра состоялась до ведения истории).")
         return "\n".join(lines)
@@ -1850,8 +1896,9 @@ def history_list_view(games: dict, page: int):
     pages = max(1, (len(items) + HISTORY_PAGE - 1) // HISTORY_PAGE)
     page = max(0, min(page, pages - 1))
     chunk = items[page * HISTORY_PAGE:(page + 1) * HISTORY_PAGE]
-    lines = [f"📚 История игр — сыграно: {len(items)}", "", *[game_title(g) for g in chunk]]
-    rows = [[btn(game_title(g), f"gh:g:{g['number']}")] for g in chunk]
+    mark = lambda g: game_title(g) + (" ⚠️" if g.get("status") == "reverted" else "")
+    lines = [f"📚 История игр — сыграно: {len(items)}", "", *[mark(g) for g in chunk]]
+    rows = [[btn(mark(g), f"gh:g:{g['number']}")] for g in chunk]
     nav = []
     if page > 0:
         nav.append(btn("◀️", f"gh:l:{page - 1}"))
@@ -2795,7 +2842,7 @@ async def cmd_match(message: types.Message, command: CommandObject):
 async def cmd_undo(message: types.Message):
     if not is_allowed(message, "отменить"):
         return
-    annulled = None
+    reverted = None
     try:
         stats = load_stats()
         games = load_games()
@@ -2818,8 +2865,8 @@ async def cmd_undo(message: types.Message):
         snapshot = {STATS_FILE: _read_bytes(STATS_FILE)}
         save_stats(stats)
         try:
-            annulled = annul_last_game(games)
-            if annulled:
+            reverted = revert_last_game(games)
+            if reverted:
                 save_games(games)
         except BaseException:
             _restore_bytes(snapshot)
@@ -2827,7 +2874,14 @@ async def cmd_undo(message: types.Message):
     except DataCorrupted as e:
         await report_data_error(e, message=message)
         return
-    tail = f"\nИгра №{annulled['number']} аннулирована (номер освобождён)." if annulled else ""
+    tail = ""
+    if reverted:
+        tail = (f"\nИгра №{reverted['number']} остаётся за этим вечером: её номер не освобождается. Исправленные данные этого "
+                f"вечера, введённые в течение {REENTRY_DAYS} дней, запишутся как Игра №{reverted['number']}.")
+        g = load_game()                           # результат из кнопок можно ввести заново для той же игры
+        if g and g.get("game_number") == reverted["number"] and g.get("result_recorded"):
+            g["result_recorded"] = False
+            save_game(g)
     await message.answer(f"Последняя игра отменена: {', '.join(p[0] for p in last)}{tail}")
 
 
