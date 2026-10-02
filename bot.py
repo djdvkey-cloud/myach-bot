@@ -21,7 +21,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.client.session.aiohttp import AiohttpSession
 
-BOT_VERSION = "2026-10-04"
+BOT_VERSION = "2026-10-06"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -45,6 +45,31 @@ BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 GAMES_FILE = os.path.join(DATA_DIR, "games.json")        # журнал состоявшихся игр (футбольных вечеров) с постоянными номерами
 # Состоявшиеся игры №1–4: даты заданы Дмитрием. Составы и голы этих игр в проекте не сохранялись — не придумываются.
 HISTORICAL_GAMES = [(1, "2026-09-07"), (2, "2026-09-14"), (3, "2026-09-21"), (4, "2026-09-28")]
+
+# Архив игр №1–4: составы и индивидуальная статистика, подтверждённые Дмитрием (восстановлено вручную).
+# Эти голы и передачи УЖЕ учтены в общей статистике (stats.json) — архив только раскладывает её по играм и stats.json НЕ меняет.
+# Игра №1: составы команд не сохранились (один общий список). Соответствия имён из старых составов подтверждены Дмитрием:
+# №2 «Тёмка» = Чичин А.; №3 «Михаил+1» = Антон от Миши (Антон и Антон от Миши — разные участники); №4 «Серёга+1» = Рим,
+# «Alexandr» = Моргун А. Отдельных игроков под старыми именами не заводим.
+HISTORICAL_ARCHIVE = {
+    1: {"split": False, "teams": [[
+        ("Ковалёв М.", 2, 6), ("Лунегов А.", 4, 2), ("Бессмертных С.", 3, 1), ("Большаков В.", 3, 1), ("Расчётов А.", 3, 1),
+        ("Мирасов Г.", 3, 1), ("Волков М.", 3, 0), ("Ларионов М.", 2, 1), ("Серганов А.", 1, 2), ("Баталов Е.", 1, 1),
+        ("Сикач И.", 0, 2), ("Азиз", 1, 0), ("Калабин Д.", 0, 0), ("Фаррух", 0, 0)]]},
+    2: {"split": True, "teams": [
+        [("Чичин А.", 3, 7), ("Калабин Д.", 2, 0), ("Расчётов А.", 4, 3), ("Ковалёв М.", 5, 4), ("Азиз", 4, 2)],
+        [("Баталов Е.", 2, 3), ("Серганов А.", 1, 0), ("Бессмертных С.", 6, 2), ("Большаков В.", 3, 3), ("Мирасов Г.", 2, 1),
+         ("Фаррух", 4, 3)]]},
+    3: {"split": True, "teams": [
+        [("Ковалёв М.", 5, 5), ("Калабин Д.", 0, 1), ("Антон", 7, 2), ("Серганов А.", 3, 1), ("Фаррух", 1, 1),
+         ("Антон от Миши", 0, 3)],
+        [("Расчётов А.", 10, 4), ("Мирасов Г.", 1, 5), ("Баталов Е.", 0, 1), ("Волков М.", 7, 4), ("Сикач И.", 3, 2),
+         ("Азиз", 3, 3)]]},
+    4: {"split": True, "teams": [
+        [("Расчётов А.", 5, 3), ("Мирасов Г.", 1, 1), ("Антон", 1, 2), ("Серганов А.", 0, 1), ("Баталов Е.", 3, 3)],
+        [("Матвеев А.", 1, 1), ("Ковалёв М.", 3, 2), ("Моргун А.", 4, 3), ("Фаррух", 1, 3), ("Рим", 5, 2)],
+        [("Волков М.", 0, 0), ("Бессмертных С.", 1, 0), ("Калабин Д.", 0, 0), ("Чичин А.", 0, 3), ("Азиз", 4, 1)]]},
+}
 BACKUP_KEEP = 40
 
 # Начальный список игроков. Используется ТОЛЬКО для первого создания
@@ -419,6 +444,110 @@ def next_game_number(data: dict) -> int:
     """Новый номер — всегда больше любого уже выданного (в том числе у игры с отменёнными данными): номера не переиспользуются."""
     used = [g["number"] for g in data["games"]] + [g["number"] for g in data.get("annulled", [])]
     return max(used, default=0) + 1
+
+
+# Соответствия, подтверждённые Дмитрием: «старое имя в статистике» → основное имя игрока (один и тот же человек).
+CONFIRMED_ALIASES = [("Alexandr", "Моргун А.")]
+
+
+def apply_confirmed_aliases() -> list:
+    """Приводит имя игрока к основному, сохраняя его pid и статистику (players_rename). Выполняется только если в статистике есть старое
+    имя и НЕТ основного; если есть оба — это реальное расхождение, ничего не трогаем. → список сообщений о выполненных действиях."""
+    done = []
+    for old, new in CONFIRMED_ALIASES:
+        data = load_players()
+        sp = stats_players_of(load_stats())
+        old_in_stats, new_in_stats = find_key(old, sp), find_key(new, sp)
+        old_key = find_key(old, data["players"])
+        if not old_in_stats or new_in_stats:
+            continue
+        if old_key is None:
+            continue
+        pid = data["players"][old_key]["pid"]
+        had_duplicate = find_key(new, data["players"]) is not None
+        players_rename(pid, new, merge_duplicate=True)
+        done.append(f"«{old}» → «{new}»: статистика и pid сохранены" + (", повторная запись реестра объединена" if had_duplicate else ""))
+    return done
+
+
+def archive_expected_totals() -> dict:
+    """Суммы по играм №1–4 из архива: {norm_key(имя): [игры, голы, передачи]} — для сверки с общей статистикой."""
+    totals: dict = {}
+    for game in HISTORICAL_ARCHIVE.values():
+        for team in game["teams"]:
+            for name, goals, assists in team:
+                t = totals.setdefault(norm_key(name), [name, 0, 0, 0])
+                t[1] += 1
+                t[2] += goals
+                t[3] += assists
+    return totals
+
+
+def archive_discrepancies(stats_players: dict) -> list:
+    """Сравнение архивных сумм с общей статистикой: список строк-расхождений (пусто — всё сходится)."""
+    expected = archive_expected_totals()
+    lines = []
+    seen = set()
+    for key, (name, games, goals, assists) in expected.items():
+        skey = find_key(name, stats_players)
+        rec = stats_players.get(skey) if skey else None
+        have = (rec.get("games", 0), rec.get("goals", 0), rec.get("assists", 0)) if rec else (0, 0, 0)
+        if skey:
+            seen.add(norm_key(skey))
+        want = (games, goals, assists)
+        if have != want:
+            diff = tuple(h - w for h, w in zip(have, want))
+            lines.append(f"{name}: архив И{games} Г{goals} П{assists} · статистика "
+                         + (f"И{have[0]} Г{have[1]} П{have[2]}" if rec else "— нет игрока") + f" · разница И{diff[0]:+d} Г{diff[1]:+d} П{diff[2]:+d}")
+    for skey, rec in stats_players.items():
+        if norm_key(skey) not in expected:
+            lines.append(f"{skey}: в статистике есть (И{rec.get('games', 0)} Г{rec.get('goals', 0)} П{rec.get('assists', 0)}), "
+                         "в архиве игр №1–4 его нет")
+    return lines
+
+
+def fill_historical_archive() -> tuple:
+    """Раскладывает УЖЕ накопленную статистику по играм №1–4 (games.json). stats.json НЕ меняется и ничего не начисляется.
+    Выполняется только если архивные суммы в точности совпадают с текущей общей статистикой; иначе ничего не пишется и
+    возвращаются расхождения (их разбирает Дмитрий). → (статус, строки): "done" | "already" | "mismatch" | "skipped"."""
+    games = load_games()
+    if games.get("history_filled"):
+        return "already", []
+    by_num = {g["number"]: g for g in games["games"]}
+    if any(n not in by_num or by_num[n].get("source") != "historical" or by_num[n].get("teams") for n in HISTORICAL_ARCHIVE):
+        return "skipped", ["Игры №1–4 в журнале отсутствуют или уже содержат данные — архив не трогаю."]
+    stats = load_stats()
+    registry = load_players()
+    sp = stats_players_of(stats)
+    problems = archive_discrepancies(sp)
+    if problems:
+        return "mismatch", problems
+    backup_file(STATS_FILE, "stats")             # резервные копии затрагиваемых и сверяемых файлов (stats.json остаётся как есть)
+    backup_file(PLAYERS_FILE, "players")
+    stats_bytes = _read_bytes(STATS_FILE)
+    snapshot = {GAMES_FILE: _read_bytes(GAMES_FILE)}
+    try:
+        for number, spec in HISTORICAL_ARCHIVE.items():
+            teams = []
+            for team in spec["teams"]:
+                row = []
+                for name, goals, assists in team:
+                    rkey = find_key(name, registry["players"])
+                    skey = find_key(name, sp)
+                    row.append({"name": rkey or skey or name, "pid": registry["players"][rkey].get("pid") if rkey else None,
+                                "goals": goals, "assists": assists})
+                teams.append(row)
+            game = by_num[number]
+            game["teams"], game["split"] = teams, spec["split"]
+            game["restored_manually"] = True
+        games["history_filled"] = True
+        save_games(games)
+        if _read_bytes(STATS_FILE) != stats_bytes:
+            raise RuntimeError("stats.json изменился во время заполнения архива")
+    except BaseException:
+        _restore_bytes(snapshot)
+        raise
+    return "done", []
 
 
 class NeedGameChoice(Exception):
@@ -905,9 +1034,11 @@ def _rename_json(obj, old: str, new: str):
     return obj
 
 
-def players_rename(pid: int, new_raw: str) -> tuple:
+def players_rename(pid: int, new_raw: str, merge_duplicate: bool = False) -> tuple:
     """Меняет имя игрока, НЕ создавая нового: pid остаётся прежним, статистика, текущий и архивные составы и
-    журнал игр переносятся на новое имя. Либо меняется всё, либо ничего (при сбое файлы возвращаются)."""
+    журнал игр переносятся на новое имя. Либо меняется всё, либо ничего (при сбое файлы возвращаются).
+    merge_duplicate=True — если новое имя уже занято ЗАПИСЬЮ РЕЕСТРА без статистики (дубль того же человека, подтверждено владельцем),
+    её username/Telegram ID/отображаемые имена переносятся в переименовываемую запись, а дубль убирается; pid остаётся прежним."""
     new = clean_player_name(new_raw)
     data = load_players()
     old, rec = player_by_pid(data, pid)
@@ -917,10 +1048,13 @@ def players_rename(pid: int, new_raw: str) -> tuple:
         raise ValueError("Имя не изменилось.")
     stats = load_stats()
     games = load_games()
+    absorbed = None
     if norm_key(new) != norm_key(old):                         # смена только регистра/«ё» — тот же человек
         clash = find_key(new, data["players"])
         if clash:
-            raise ValueError(f"Игрок «{clash}» уже есть в списке. Чтобы объединить записи, используйте /переименовать.")
+            if not merge_duplicate:
+                raise ValueError(f"Игрок «{clash}» уже есть в списке. Чтобы объединить записи, используйте /переименовать.")
+            absorbed = clash
         clash = find_key(new, stats_players_of(stats))
         if clash:
             raise ValueError(f"В статистике уже есть «{clash}». Чтобы объединить записи, используйте /переименовать.")
@@ -952,6 +1086,12 @@ def players_rename(pid: int, new_raw: str) -> tuple:
                     renamed = _rename_json(obj, old, new)
                     if renamed != obj:
                         save_json(path, renamed)
+        if absorbed:
+            dup = data["players"].pop(absorbed)
+            for field in ("usernames", "aliases"):
+                have = {x.lower() for x in rec[field]}
+                rec[field] += [x for x in dup[field] if x.lower() not in have]
+            rec["ids"] += [x for x in dup["ids"] if x not in rec["ids"]]
         data["players"] = {(new if k == old else k): v for k, v in data["players"].items()}
         save_players(data)
     except BaseException:
@@ -1429,8 +1569,9 @@ HELP_SECTIONS = {
         "Кнопка «📚 История игр» в панели или /история (только у вас в личке). Список состоявшихся игр, новые сверху: "
         "«Игра №4 — 28.09.2026». При выборе игры — составы всех команд именно той игры и возле каждого игрока ⚽ его голы "
         "и 🎯 передачи в этой игре. Общей статистики и счёта отдельных матчей там нет.\n\n"
-        "Игры №1–4 (07.09, 14.09, 21.09, 28.09.2026) заведены по датам; их составы и голы в проекте не сохранялись и не "
-        "выдумываются. Начиная с №5 архив пополняется при записи результата («⚽ Внести результат матча» или /матч). "
+        "Игры №1–4 (07.09, 14.09, 21.09, 28.09.2026): архив восстановлен вручную по данным Дмитрия — №1 списком участников без "
+        "составов команд, №2–4 с командами; голы и передачи в них уже входят в общую статистику и повторно не начисляются. "
+        "Начиная с №5 архив пополняется при записи результата («⚽ Внести результат матча» или /матч). "
         "Журнал хранится в /data/games.json.\n\n"
         "Ограничения: игра, записанная через /матч, показывается списком игроков без деления на команды."
     ),
@@ -1886,7 +2027,8 @@ def game_view_text(game: dict, registry: dict) -> str:
     by_pid = {rec.get("pid"): name for name, rec in registry["players"].items()}
     split = game.get("split", True)
     if not split:
-        lines.append("Игроки (деление на команды при записи не указывалось):")
+        lines.append("Составы команд не сохранились. Участники:" if game.get("source") == "historical"
+                     else "Игроки (деление на команды при записи не указывалось):")
     for i, team in enumerate(teams):
         if split:
             if i:
@@ -3126,10 +3268,46 @@ async def notify_started(menu: dict):
         print(f"Не удалось отправить стартовое сообщение: {e}")
 
 
+async def notify_archive():
+    """При запуске: заполняет архив игр №1–4 (если сверка со статистикой сошлась) и сообщает Дмитрию результат."""
+    merged = []
+    try:
+        if not load_games().get("history_filled"):
+            merged = apply_confirmed_aliases()
+            for line in merged:
+                print(f"[ARCHIVE] имя игрока: {line}")
+        status, lines = fill_historical_archive()
+    except DataCorrupted as e:
+        print(f"[ARCHIVE] данные недоступны: {e}")
+        return
+    except Exception as e:
+        print(f"[ARCHIVE] ошибка: {type(e).__name__}: {e}")
+        return
+    print(f"[ARCHIVE] {status}")
+    for line in lines[:40]:
+        print(f"[ARCHIVE] {line}")
+    note = ("\nИмя игрока: " + "; ".join(merged)) if merged else ""
+    if status == "done":
+        text = ("📚 Архив игр №1–4 заполнен по подтверждённым данным (№1 — без составов команд). Суммы общей статистики не менялись: "
+                "сверка с архивом сошлась без расхождений. Проверьте: «📚 История игр»." + note)
+    elif status == "mismatch":
+        text = ("⚠️ Архив игр №1–4 НЕ заполнен: архивные суммы расходятся с общей статистикой. Ничего не изменено. "
+                "Расхождения:\n" + "\n".join(lines[:25]) + "\n\nНужно решение Дмитрия: что верно — архив или статистика?" + note)
+    elif status == "skipped":
+        text = "ℹ️ " + "; ".join(lines)
+    else:
+        return
+    try:
+        await bot.send_message(OWNER_ID, text)
+    except Exception as e:
+        print(f"Не удалось отправить итог архива: {e}")
+
+
 async def main():
     print(f"Постоянный запуск бота {datetime.datetime.now(YEKB_TZ)} версия {BOT_VERSION}")
     menu = await setup_menu()
     await notify_started(menu)
+    await notify_archive()
     scheduler = asyncio.create_task(poll_scheduler())
     try:
         await dp.start_polling(bot)
