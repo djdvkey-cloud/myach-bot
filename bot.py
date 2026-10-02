@@ -25,7 +25,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # Будущие даты в номере не использовать. История: 2026-10-01 (меню, игроки в /data, фактический состав); 2026-10-02 (нумерация игр,
 # История игр, публикация статистики, редактирование игрока); 2026-10-03 … 2026-10-06 — версии с заранее проставленными датами
 # (архив игр №1–4, /отменить без освобождения номера); начиная с 2026-10-03.1 — по реальной дате деплоя.
-BOT_VERSION = "2026-10-03.1"
+BOT_VERSION = "2026-10-03.2"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -1229,8 +1229,19 @@ def pick_phrase(kind: str, phrases: list, rng=random) -> str:
 # Опрос
 # ============================================================
 
+_POLL_SENT_DAY = None        # защита в памяти: суббота, в которую опрос уже ушёл (на случай сбоя записи маркера на диск)
+
+
+def poll_target_monday(day: datetime.date) -> datetime.date:
+    """Ближайший понедельник после дня day (в субботу — через 2 дня; в понедельник — через 7)."""
+    ahead = (7 - day.weekday()) % 7
+    return day + datetime.timedelta(days=ahead or 7)
+
+
 def poll_done_today(day: datetime.date) -> bool:
     """Сегодняшний опрос уже создан — автоматикой или вручную."""
+    if _POLL_SENT_DAY == day:
+        return True
     if os.path.exists(LAST_POLL_FILE):
         try:
             with open(LAST_POLL_FILE) as f:
@@ -1245,12 +1256,10 @@ async def create_game_poll(chat_id: int, *, manual: bool = False) -> str:
     """Публикует опрос. В субботу и ручной, и автоматический опрос считаются
     «опросом этой субботы» (общий маркер), поэтому автоматика не пришлёт
     второй. Ручной опрос в другой день маркер субботы не ставит."""
+    global _POLL_SENT_DAY
     now = datetime.datetime.now(YEKB_TZ)
     today = now.date()
-    days_until_monday = (7 - today.weekday()) % 7
-    if days_until_monday == 0:
-        days_until_monday = 7
-    monday = today + datetime.timedelta(days=days_until_monday)
+    monday = poll_target_monday(today)
     phrase = pick_phrase("poll", POLL_PHRASES)
     question = f"{phrase} Футбол Лестех понедельник {monday.strftime('%d.%m.%Y')} {GAME_TIME}"
     poll_message = await bot.send_poll(
@@ -1259,16 +1268,25 @@ async def create_game_poll(chat_id: int, *, manual: bool = False) -> str:
         options=["+", "-"],
         is_anonymous=False,
     )
-    save_json(POLL_STATE_FILE, {
-        "poll_id": poll_message.poll.id,
-        "message_id": poll_message.message_id,
-        "date": today.isoformat(),
-        "voters": {},
-        "manual": manual,
-    })
     if today.weekday() == 5:
-        with open(LAST_POLL_FILE, "w") as f:
-            f.write(today.isoformat())
+        _POLL_SENT_DAY = today               # сразу: даже если запись на диск ниже не удастся, второй опрос не уйдёт
+    try:
+        save_json(POLL_STATE_FILE, {
+            "poll_id": poll_message.poll.id,
+            "message_id": poll_message.message_id,
+            "date": today.isoformat(),
+            "monday": monday.isoformat(),
+            "voters": {},
+            "manual": manual,
+        })
+    except Exception as e:
+        print(f"[POLL] опрос отправлен, но poll_state.json не записан: {type(e).__name__}: {e}")
+    if today.weekday() == 5:
+        try:
+            with open(LAST_POLL_FILE, "w") as f:
+                f.write(today.isoformat())
+        except Exception as e:
+            print(f"[POLL] опрос отправлен, но маркер субботы не записан: {type(e).__name__}: {e}")
     print(f"Опрос отправлен ({'вручную' if manual else 'авто'}): {question}")
     return question
 
@@ -1293,6 +1311,41 @@ async def maybe_send_poll(now: datetime.datetime | None = None) -> bool:
             return False
 
 
+def next_poll_info(now: datetime.datetime | None = None) -> dict:
+    """Когда сработает автоопрос: суббота 12:00 (Екатеринбург). → {"saturday", "monday", "status"}:
+    scheduled — ещё впереди; catchup — суббота после 12:00, опрос не отправлен (уйдёт при ближайшей проверке); done — на эту субботу уже отправлен
+    (тогда следующая суббота)."""
+    now = (now or datetime.datetime.now(YEKB_TZ)).astimezone(YEKB_TZ)
+    today = now.date()
+    if now.weekday() == 5 and now.hour >= 12:
+        if poll_done_today(today):
+            return {"saturday": today + datetime.timedelta(days=7), "monday": poll_target_monday(today + datetime.timedelta(days=7)),
+                    "status": "done"}
+        return {"saturday": today, "monday": poll_target_monday(today), "status": "catchup"}
+    saturday = today + datetime.timedelta(days=(5 - today.weekday()) % 7)
+    return {"saturday": saturday, "monday": poll_target_monday(saturday), "status": "scheduled"}
+
+
+def poll_status_lines(now: datetime.datetime | None = None) -> list:
+    info = next_poll_info(now)
+    day = f"{info['saturday']:%d.%m.%Y}"
+    how = {"scheduled": "", "catchup": " (суббота после 12:00: опрос будет отправлен при ближайшей проверке)",
+           "done": " (опрос этой субботы уже отправлен)"}[info["status"]]
+    lines = [f"🗳 Следующий автоопрос: суббота {day} 12:00 (Asia/Yekaterinburg) на понедельник {info['monday']:%d.%m.%Y}{how}"]
+    state = load_json(POLL_STATE_FILE, {})
+    try:
+        existing = datetime.date.fromisoformat(state.get("monday") or "") if state.get("monday") else (
+            poll_target_monday(datetime.date.fromisoformat(state["date"])) if state.get("date") else None)
+    except ValueError:
+        existing = None
+    if existing == info["monday"] and info["status"] != "done" and state.get("date") != info["saturday"].isoformat():
+        sent = state.get("date", "?")
+        lines.append(f"⚠️ На понедельник {existing:%d.%m.%Y} опрос уже отправлялся {'вручную' if state.get('manual') else 'ранее'} "
+                     f"({sent[8:10]}.{sent[5:7]}). Ручной опрос не в субботу автоопрос не блокирует — в субботу уйдёт ещё один "
+                     "(и именно за ним бот будет считать голоса для /разделить).")
+    return lines
+
+
 async def poll_scheduler():
     """Раз в минуту проверяет, не пора ли отправить опрос.
 
@@ -1303,8 +1356,13 @@ async def poll_scheduler():
     что цикл ещё тикает."""
     tick = 0
     print(f"[DEBUG] планировщик опроса запущен {datetime.datetime.now(YEKB_TZ):%d.%m.%Y %H:%M}")
+    for line in poll_status_lines():
+        print(f"[DEBUG] {line}")
     while True:
-        await maybe_send_poll()
+        try:
+            await maybe_send_poll()
+        except Exception as e:                      # любая неожиданная ошибка не должна останавливать расписание
+            print(f"[POLL] ошибка планировщика: {type(e).__name__}: {e}")
         tick += 1
         if tick % 30 == 0:
             print(f"[DEBUG] планировщик жив, тик {tick}, {datetime.datetime.now(YEKB_TZ):%d.%m.%Y %H:%M}")
@@ -3326,6 +3384,7 @@ async def notify_started(menu: dict):
         f"📋 Меню: у вас {counts.get('owner', '?')} команд, в общем чате и у остальных "
         + ("скрыто ✅" if hidden else f"НЕ скрыто ⚠️ {counts}"),
         f"🔘 Кнопка меню до настройки: {menu.get('before_button')}, после: {menu.get('after_button')}",
+        *poll_status_lines(),
     ]
     if menu.get("errors"):
         lines.append("Замечания: " + "; ".join(menu["errors"][:3]))

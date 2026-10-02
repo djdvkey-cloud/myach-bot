@@ -214,7 +214,7 @@ class Versioning(Base):
         self.assertIsNotNone(m, B.BOT_VERSION)
         day = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         self.assertLessEqual(day, datetime.date.today())
-        self.assertEqual(B.BOT_VERSION, "2026-10-03.1")
+        self.assertEqual(B.BOT_VERSION, "2026-10-03.2")
 
     async def test_startup_message_shows_version(self):
         report = await B.setup_menu()
