@@ -34,6 +34,11 @@ class FakeBot:
         self.sent = []          # (chat_id, text)
         self.polls = []
         self.fail_send = False
+        self.probes = []
+        self.probe_error = False
+        self.deleted = set()
+        self.extra_messages = set()
+        self.chat_polls_only = True      # существуют только сообщения, реально отправленные заглушкой (и extra_messages)
         self.calls = []
         self.commands = {}      # scope-ключ -> список команд
         self.menu_button = "default"
@@ -46,7 +51,20 @@ class FakeBot:
     async def send_poll(self, chat_id, question, options, is_anonymous=True, **kw):
         self.polls.append((chat_id, question, options))
         return pytypes.SimpleNamespace(poll=pytypes.SimpleNamespace(id=f"poll{len(self.polls)}"),
-                                       message_id=len(self.polls))
+                                       message_id=len(self.polls), chat=pytypes.SimpleNamespace(id=chat_id))
+
+    async def edit_message_reply_markup(self, chat_id=None, message_id=None, reply_markup=None, **kw):
+        """Проверка существования сообщения у Telegram: «not modified» — есть, «not found» — нет."""
+        from aiogram.exceptions import TelegramBadRequest
+        self.probes.append((chat_id, message_id))
+        if self.probe_error:
+            raise RuntimeError("network down")
+        if (chat_id, message_id) in self.deleted or (self.chat_polls_only and (chat_id, message_id) not in self.real_messages()):
+            raise TelegramBadRequest(method=None, message="Bad Request: message to edit not found")
+        raise TelegramBadRequest(method=None, message="Bad Request: message is not modified: specified new message content and reply markup are exactly the same")
+
+    def real_messages(self):
+        return {(c, i + 1) for i, (c, _, _) in enumerate(self.polls)} | self.extra_messages
 
     @staticmethod
     def _key(scope):
@@ -156,6 +174,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
         self.patches.append(p)
         B.AWAITING.clear()
         B._POLL_SENT_DAY = None
+        B._PUBLISHED_MONDAYS.clear()
 
     def tearDown(self):
         for p in self.patches:
@@ -461,11 +480,14 @@ class PollTests(Base):
         self.assertFalse(await B.maybe_send_poll())
         self.assertEqual(len(self.fake.polls), 1)
 
-    async def test_manual_poll_on_other_day_does_not_block_saturday(self):
-        self.set_now(real_dt.datetime(2026, 10, 2, 15, 0))     # пятница
+    async def test_really_published_manual_poll_on_other_day_blocks_saturday_for_same_monday(self):
+        self.set_now(real_dt.datetime(2026, 10, 2, 15, 0))     # пятница: опрос РЕАЛЬНО опубликован в общий чат (есть message_id)
         await B.cmd_poll(owner_msg(), cmd("опрос", None))
         self.assertEqual(len(self.fake.polls), 1)
         self.set_now(real_dt.datetime(2026, 10, 3, 12, 0))
+        self.assertFalse(await B.maybe_send_poll())            # дубль на тот же понедельник не нужен
+        self.assertEqual(len(self.fake.polls), 1)
+        self.set_now(real_dt.datetime(2026, 10, 10, 12, 0))    # следующая неделя — снова работает
         self.assertTrue(await B.maybe_send_poll())
         self.assertEqual(len(self.fake.polls), 2)
 

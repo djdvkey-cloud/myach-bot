@@ -39,6 +39,7 @@ class PollBase(Base):
     def restart(self):
         """Перезапуск контейнера: память процесса теряется, файлы /data остаются."""
         B._POLL_SENT_DAY = None
+        B._PUBLISHED_MONDAYS.clear()
 
 
 class CurrentCycle(PollBase):
@@ -89,28 +90,6 @@ class CurrentCycle(PollBase):
         info = B.next_poll_info()
         self.assertEqual((info["status"], info["saturday"], info["monday"]), ("done", real_dt.date(2026, 10, 10), real_dt.date(2026, 10, 12)))
         self.assertIn("опрос этой субботы уже отправлен", B.poll_status_lines()[0])
-
-    def test_status_warns_about_earlier_manual_poll_for_same_monday(self):
-        """Реальный случай: 30.09 вручную отправлен опрос на 05.10 (poll_state без поля monday)."""
-        B.save_json(B.POLL_STATE_FILE, {"poll_id": "p1", "message_id": 5, "date": "2026-09-30", "voters": {}, "manual": True})
-        self.at(2026, 10, 3, 0, 20)
-        lines = B.poll_status_lines()
-        self.assertEqual(len(lines), 2)
-        self.assertIn("На понедельник 05.10.2026 опрос уже отправлялся вручную (30.09)", lines[1])
-        self.assertIn("уйдёт ещё один", lines[1])
-        # другая неделя / уже отправленный субботний — предупреждения нет
-        B.save_json(B.POLL_STATE_FILE, {"poll_id": "p0", "message_id": 4, "date": "2026-09-26", "monday": "2026-09-28", "voters": {}, "manual": False})
-        self.assertEqual(len(B.poll_status_lines()), 1)
-
-    async def test_manual_poll_on_other_day_still_does_not_block_saturday(self):
-        """Принятое правило не менялось: ручной не в субботу автоопрос не блокирует."""
-        self.at(2026, 9, 30, 20, 18)
-        await B.cmd_poll(owner_msg(), cmd("опрос", None))
-        self.assertEqual(len(self.fake.polls), 1)
-        self.at(2026, 10, 3, 12, 0)
-        self.assertTrue(await B.maybe_send_poll())
-        self.assertEqual(len(self.fake.polls), 2)
-
 
 class RecurringWeeks(PollBase):
     async def test_every_saturday_for_half_a_year_exactly_one_poll_for_next_monday(self):
@@ -167,7 +146,7 @@ class RecurringWeeks(PollBase):
         second = B.load_json(B.POLL_STATE_FILE)
         self.assertNotEqual(first["poll_id"], second["poll_id"])
         self.assertEqual((second["date"], second["monday"]), ("2026-10-10", "2026-10-12"))
-        self.assertEqual(set(second), {"poll_id", "message_id", "date", "monday", "voters", "manual"})   # один файл, без накопления
+        self.assertEqual(set(second), {"poll_id", "message_id", "chat_id", "date", "monday", "status", "published", "published_at", "voters", "manual"})   # один файл, без накопления
 
 
 class Restarts(PollBase):

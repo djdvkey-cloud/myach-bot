@@ -25,7 +25,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # Будущие даты в номере не использовать. История: 2026-10-01 (меню, игроки в /data, фактический состав); 2026-10-02 (нумерация игр,
 # История игр, публикация статистики, редактирование игрока); 2026-10-03 … 2026-10-06 — версии с заранее проставленными датами
 # (архив игр №1–4, /отменить без освобождения номера); начиная с 2026-10-03.1 — по реальной дате деплоя.
-BOT_VERSION = "2026-10-03.2"
+BOT_VERSION = "2026-10-03.3"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -1230,6 +1230,62 @@ def pick_phrase(kind: str, phrases: list, rng=random) -> str:
 # ============================================================
 
 _POLL_SENT_DAY = None        # защита в памяти: суббота, в которую опрос уже ушёл (на случай сбоя записи маркера на диск)
+_PUBLISHED_MONDAYS: set = set()      # защита в памяти: понедельники, на которые опрос уже ФАКТИЧЕСКИ опубликован в этом процессе
+
+
+def poll_state_monday(state: dict):
+    """Понедельник, на который сделан опрос из poll_state (у старых записей поля monday нет — считается по дате создания)."""
+    try:
+        if state.get("monday"):
+            return datetime.date.fromisoformat(state["monday"])
+        if state.get("date"):
+            return poll_target_monday(datetime.date.fromisoformat(state["date"]))
+    except ValueError:
+        pass
+    return None
+
+
+async def poll_message_exists(chat_id: int, message_id: int):
+    """Есть ли сообщение в чате (без видимых изменений): пустая правка разметки. «not modified» — сообщение существует,
+    «not found» — его нет. True / False / None (не удалось определить: сеть, права)."""
+    try:
+        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+    except TelegramBadRequest as e:
+        text = str(e).lower()
+        if "not modified" in text:
+            return True
+        if "not found" in text or "message_id_invalid" in text:
+            return False
+        return None
+    except Exception:
+        return None
+    return True
+
+
+async def poll_already_published(target_monday: datetime.date) -> bool:
+    """ФАКТИЧЕСКИ ли опубликован опрос на этот понедельник в общем чате. Черновик/предпросмотр (published = false) и записи без message_id
+    не считаются. Для записей, где подтверждение отправки не сохранено (старый формат), наличие сообщения проверяется у Telegram.
+    Блокирует автоопрос только подтверждённая публикация."""
+    if target_monday in _PUBLISHED_MONDAYS:
+        return True
+    state = load_json(POLL_STATE_FILE, {})
+    if state.get("published") is False or state.get("status") == "draft":
+        return False
+    message_id = state.get("message_id")
+    if not message_id or poll_state_monday(state) != target_monday:
+        return False
+    if state.get("chat_id", CHAT_ID) != CHAT_ID:
+        return False                                            # опрос уходил не в общий чат
+    verdict = await poll_message_exists(CHAT_ID, message_id)
+    recorded = state.get("published") is True                    # успех отправки записан нашим кодом
+    if verdict is False:
+        print(f"[POLL] опрос message_id={message_id} на {target_monday:%d.%m.%Y} в общем чате не найден — не считается опубликованным")
+        return False
+    if verdict is True or recorded:
+        _PUBLISHED_MONDAYS.add(target_monday)
+        return True
+    print(f"[POLL] не удалось проверить опрос message_id={message_id} в общем чате — автоопрос не блокируется")
+    return False
 
 
 def poll_target_monday(day: datetime.date) -> datetime.date:
@@ -1268,14 +1324,22 @@ async def create_game_poll(chat_id: int, *, manual: bool = False) -> str:
         options=["+", "-"],
         is_anonymous=False,
     )
+    # Отправка в Telegram УСПЕШНА (иначе выше было бы исключение и ничего не записалось): message_id и chat_id — из ответа Telegram.
+    sent_chat = getattr(getattr(poll_message, "chat", None), "id", None) or chat_id
     if today.weekday() == 5:
         _POLL_SENT_DAY = today               # сразу: даже если запись на диск ниже не удастся, второй опрос не уйдёт
+    if sent_chat == CHAT_ID:
+        _PUBLISHED_MONDAYS.add(monday)
     try:
         save_json(POLL_STATE_FILE, {
             "poll_id": poll_message.poll.id,
             "message_id": poll_message.message_id,
+            "chat_id": sent_chat,
             "date": today.isoformat(),
             "monday": monday.isoformat(),
+            "status": "published",
+            "published": sent_chat == CHAT_ID,
+            "published_at": now_iso(),
             "voters": {},
             "manual": manual,
         })
@@ -1287,7 +1351,7 @@ async def create_game_poll(chat_id: int, *, manual: bool = False) -> str:
                 f.write(today.isoformat())
         except Exception as e:
             print(f"[POLL] опрос отправлен, но маркер субботы не записан: {type(e).__name__}: {e}")
-    print(f"Опрос отправлен ({'вручную' if manual else 'авто'}): {question}")
+    print(f"Опрос отправлен ({'вручную' if manual else 'авто'}) в чат {sent_chat}, message_id={poll_message.message_id}: {question}")
     return question
 
 
@@ -1303,6 +1367,8 @@ async def maybe_send_poll(now: datetime.datetime | None = None) -> bool:
     async with POLL_LOCK:
         if poll_done_today(now.date()):
             return False
+        if await poll_already_published(poll_target_monday(now.date())):
+            return False                                    # на этот понедельник опрос уже реально опубликован (в т.ч. вручную)
         try:
             await create_game_poll(CHAT_ID)
             return True
@@ -1331,19 +1397,30 @@ def poll_status_lines(now: datetime.datetime | None = None) -> list:
     day = f"{info['saturday']:%d.%m.%Y}"
     how = {"scheduled": "", "catchup": " (суббота после 12:00: опрос будет отправлен при ближайшей проверке)",
            "done": " (опрос этой субботы уже отправлен)"}[info["status"]]
-    lines = [f"🗳 Следующий автоопрос: суббота {day} 12:00 (Asia/Yekaterinburg) на понедельник {info['monday']:%d.%m.%Y}{how}"]
+    return [f"🗳 Следующий автоопрос: суббота {day} 12:00 (Asia/Yekaterinburg) на понедельник {info['monday']:%d.%m.%Y}{how}"]
+
+
+async def poll_state_line(now: datetime.datetime | None = None) -> str:
+    """Что известно о ранее созданном опросе на ближайший понедельник — ПОДТВЕРЖДЕНИЕ у Telegram, а не по poll_state."""
+    info = next_poll_info(now)
     state = load_json(POLL_STATE_FILE, {})
-    try:
-        existing = datetime.date.fromisoformat(state.get("monday") or "") if state.get("monday") else (
-            poll_target_monday(datetime.date.fromisoformat(state["date"])) if state.get("date") else None)
-    except ValueError:
-        existing = None
-    if existing == info["monday"] and info["status"] != "done" and state.get("date") != info["saturday"].isoformat():
-        sent = state.get("date", "?")
-        lines.append(f"⚠️ На понедельник {existing:%d.%m.%Y} опрос уже отправлялся {'вручную' if state.get('manual') else 'ранее'} "
-                     f"({sent[8:10]}.{sent[5:7]}). Ручной опрос не в субботу автоопрос не блокирует — в субботу уйдёт ещё один "
-                     "(и именно за ним бот будет считать голоса для /разделить).")
-    return lines
+    monday = poll_state_monday(state)
+    message_id = state.get("message_id")
+    if info["status"] == "done" or not message_id or monday != info["monday"]:
+        return ""
+    if state.get("published") is False or state.get("status") == "draft":
+        return f"📝 В poll_state на {monday:%d.%m.%Y} только черновик (в общий чат не публиковался) — автоопрос выйдет."
+    exists = await poll_message_exists(state.get("chat_id", CHAT_ID), message_id)
+    sent = state.get("date", "?")
+    made = f"{sent[8:10]}.{sent[5:7]}" if len(sent) >= 10 else "?"
+    if exists is True:
+        return (f"⚠️ В общем чате СУЩЕСТВУЕТ опрос на {monday:%d.%m.%Y} (message_id {message_id}, создан {made}): "
+                "автоопрос на этот понедельник второй не отправит.")
+    if exists is False:
+        return (f"ℹ️ Запись об опросе на {monday:%d.%m.%Y} (message_id {message_id}, {made}) есть, но сообщения в общем чате нет — "
+                "в poll_state это не считается публикацией, автоопрос выйдет.")
+    return (f"ℹ️ Запись об опросе на {monday:%d.%m.%Y} (message_id {message_id}, {made}): наличие сообщения в чате проверить не удалось — "
+            "автоопрос выйдет.")
 
 
 async def poll_scheduler():
@@ -1358,6 +1435,9 @@ async def poll_scheduler():
     print(f"[DEBUG] планировщик опроса запущен {datetime.datetime.now(YEKB_TZ):%d.%m.%Y %H:%M}")
     for line in poll_status_lines():
         print(f"[DEBUG] {line}")
+    probe_line = await poll_state_line()
+    if probe_line:
+        print(f"[POLL] {probe_line}")
     while True:
         try:
             await maybe_send_poll()
@@ -1615,6 +1695,11 @@ HELP_SECTIONS = {
         "Вручную: кнопка «🗳 Опрос» в меню или /опрос (/poll). Ручной опрос в субботу считается "
         "субботним — автоматика второй не пришлёт. Если опрос за сегодня уже есть, "
         "повторный создаётся только командой /опрос да.\n\n"
+        "Что считается опубликованным: кнопка «🗳 Опрос» → «📢 Опубликовать сейчас» (и /опрос) публикуют опрос в общий чат СРАЗУ "
+        "(предпросмотра нет); первый экран с подтверждением — ещё не публикация. Опубликованным опрос на понедельник считается "
+        "только после успешной отправки в общий чат (сохраняются message_id, чат, время). Только такой опрос не даёт автоматике "
+        "отправить второй на тот же понедельник; черновик/неотправленное автоматику не блокирует. Для записей старого формата бот "
+        "проверяет у Telegram, есть ли сообщение в чате.\n\n"
         "Ограничения: опрос всегда на ближайший понедельник; автокатч-ап работает только в субботу."
     ),
     "players": (
@@ -1963,20 +2048,25 @@ async def cb_panel(query: types.CallbackQuery):
     elif action == "history":
         await show_history_list(query, 0)
     elif action == "poll":
-        if poll_done_today(datetime.datetime.now(YEKB_TZ).date()):
+        today = datetime.datetime.now(YEKB_TZ).date()
+        monday = poll_target_monday(today)
+        if poll_done_today(today):
             note = "\n\n⚠️ Опрос на сегодня уже создан. Создать ещё один?"
+        elif monday in _PUBLISHED_MONDAYS:
+            note = f"\n\n⚠️ На понедельник {monday:%d.%m.%Y} опрос уже опубликован. Опубликовать ещё один?"
         else:
             note = ""
         await edit_or_send(
             query,
-            "🗳 Создать опрос в общем чате на ближайший понедельник?" + note,
-            kb([[btn("✅ Создать опрос", "m:pollgo"), btn("❌ Отмена", "m:home")]]),
+            f"📢 Опубликовать опрос в ОБЩЕМ чате на понедельник {monday:%d.%m.%Y}?\n"
+            "Предпросмотра нет: после нажатия опрос сразу увидят все участники чата." + note,
+            kb([[btn("📢 Опубликовать сейчас", "m:pollgo"), btn("❌ Отмена", "m:home")]]),
         )
     elif action == "pollgo":
         try:
             async with POLL_LOCK:
                 question = await create_game_poll(CHAT_ID, manual=True)
-            await edit_or_send(query, f"✅ Опрос отправлен в общий чат:\n{question}", kb([[btn("⬅️ Меню", "m:home")]]))
+            await edit_or_send(query, f"✅ Опрос ОПУБЛИКОВАН в общем чате:\n{question}", kb([[btn("⬅️ Меню", "m:home")]]))
         except Exception as e:
             await edit_or_send(query, f"❌ Не удалось отправить опрос: {e}", kb([[btn("⬅️ Меню", "m:home")]]))
     await ack(query)
@@ -3386,6 +3476,12 @@ async def notify_started(menu: dict):
         f"🔘 Кнопка меню до настройки: {menu.get('before_button')}, после: {menu.get('after_button')}",
         *poll_status_lines(),
     ]
+    try:
+        probe = await poll_state_line()           # подтверждение у Telegram: есть ли уже опрос на ближайший понедельник в общем чате
+        if probe:
+            lines.append(probe)
+    except Exception as e:
+        print(f"[POLL] не удалось проверить состояние опроса: {type(e).__name__}: {e}")
     if menu.get("errors"):
         lines.append("Замечания: " + "; ".join(menu["errors"][:3]))
     lines.append("\nПанель: /menu · Инструкция: /help")

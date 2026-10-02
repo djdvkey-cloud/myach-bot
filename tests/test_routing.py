@@ -98,6 +98,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.patches.append(p)
         B.AWAITING.clear()
         B._POLL_SENT_DAY = None
+        B._PUBLISHED_MONDAYS.clear()
 
     def tearDown(self):
         for p in self.patches:
