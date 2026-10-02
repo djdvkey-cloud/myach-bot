@@ -143,7 +143,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
             "DATA_DIR": self.tmp, "STATS_FILE": "stats.json", "LAST_POLL_FILE": "last_poll.txt",
             "POLL_STATE_FILE": "poll_state.json", "GUESTS_FILE": "guests.json",
             "PLAYERS_FILE": "players.json", "GAME_FILE": "game.json",
-            "GAME_ARCHIVE_FILE": "game_archive.json", "META_FILE": "ui_meta.json",
+            "GAME_ARCHIVE_FILE": "game_archive.json", "GAMES_FILE": "games.json", "META_FILE": "ui_meta.json",
             "BACKUP_DIR": "backups",
         }
         for name, val in paths.items():

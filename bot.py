@@ -5,6 +5,7 @@
 """
 import asyncio
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -20,7 +21,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.client.session.aiohttp import AiohttpSession
 
-BOT_VERSION = "2026-10-01"
+BOT_VERSION = "2026-10-02"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -41,6 +42,9 @@ GAME_FILE = os.path.join(DATA_DIR, "game.json")
 GAME_ARCHIVE_FILE = os.path.join(DATA_DIR, "game_archive.json")
 META_FILE = os.path.join(DATA_DIR, "ui_meta.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+GAMES_FILE = os.path.join(DATA_DIR, "games.json")        # журнал состоявшихся игр (футбольных вечеров) с постоянными номерами
+# Состоявшиеся игры №1–4: даты заданы Дмитрием. Составы и голы этих игр в проекте не сохранялись — не придумываются.
+HISTORICAL_GAMES = [(1, "2026-09-07"), (2, "2026-09-14"), (3, "2026-09-21"), (4, "2026-09-28")]
 BACKUP_KEEP = 40
 
 # Начальный список игроков. Используется ТОЛЬКО для первого создания
@@ -331,12 +335,139 @@ def stats_players_of(stats: dict) -> dict:
     return stats.get(str(CHAT_ID), {}).get("players", {})
 
 
-def record_match(players: list) -> list:
-    """Записывает игру в статистику: players — [(имя, голы, передачи)].
-    Возвращает записанные (каноническое имя, голы, передачи).
-    DataCorrupted — ничего не записано, файл не тронут."""
+# ---- журнал игр (games.json): «Игра» = весь футбольный вечер, счёт отдельных матчей не ведётся ----
+
+def _seed_games() -> dict:
+    return {"version": 1,
+            "games": [{"number": n, "date": d, "teams": None, "source": "historical"} for n, d in HISTORICAL_GAMES],
+            "annulled": []}
+
+
+def validate_games(data):
+    if not isinstance(data, dict) or not isinstance(data.get("games"), list):
+        raise ValueError("нет списка games")
+    seen = set()
+    for g in data["games"]:
+        if not isinstance(g, dict):
+            raise ValueError("игра не словарь")
+        n = g.get("number")
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1 or n in seen:
+            raise ValueError(f"неверный или повторяющийся номер игры {n!r}")
+        seen.add(n)
+        try:
+            datetime.date.fromisoformat(g.get("date", ""))
+        except (ValueError, TypeError):
+            raise ValueError(f"игра №{n}: неверная дата")
+        teams = g.get("teams")
+        if teams is not None:
+            if not isinstance(teams, list):
+                raise ValueError(f"игра №{n}: teams не список")
+            for team in teams:
+                if not isinstance(team, list):
+                    raise ValueError(f"игра №{n}: команда не список")
+                for pl in team:
+                    if (not isinstance(pl, dict) or not isinstance(pl.get("name"), str)
+                            or not _num_ok(pl.get("goals", 0)) or not _num_ok(pl.get("assists", 0))):
+                        raise ValueError(f"игра №{n}: некорректная запись игрока")
+    if not isinstance(data.get("annulled", []), list):
+        raise ValueError("annulled не список")
+
+
+def load_games() -> dict:
+    """Строго, как статистика: повреждённый журнал не считается пустым. Первый запуск — игры №1–4."""
+    data = load_json_strict(GAMES_FILE)
+    if data is _MISSING:
+        if list_backups("games"):
+            raise DataCorrupted(GAMES_FILE, "файл отсутствует, хотя есть резервные копии")
+        data = _seed_games()
+        save_json(GAMES_FILE, data)
+        print("Создан /data/games.json: игры №1–4 (только номера и даты)")
+        return data
+    try:
+        validate_games(data)
+    except ValueError as e:
+        raise DataCorrupted(GAMES_FILE, str(e))
+    data.setdefault("annulled", [])
+    return data
+
+
+def save_games(data: dict):
+    validate_games(data)
+    backup_file(GAMES_FILE, "games")
+    save_json(GAMES_FILE, data)
+
+
+def played_games_count() -> int:
+    """Источник числа «сыграно игр: N» — количество состоявшихся пронумерованных игр (не строки статистики)."""
+    return len(load_games()["games"])
+
+
+def next_game_number(data: dict) -> int:
+    return max((g["number"] for g in data["games"]), default=0) + 1
+
+
+def game_date_now() -> str:
+    """Дата футбольного вечера: запись после полуночи (до 06:00 по Екатеринбургу) относится к прошедшему вечеру."""
+    now = datetime.datetime.now(YEKB_TZ)
+    if now.hour < 6:
+        now = now - datetime.timedelta(days=1)
+    return now.date().isoformat()
+
+
+def fmt_game_date(iso: str) -> str:
+    return f"{iso[8:10]}.{iso[5:7]}.{iso[0:4]}"
+
+
+def game_title(game: dict) -> str:
+    return f"Игра №{game['number']} — {fmt_game_date(game['date'])}"
+
+
+def _read_bytes(path: str):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _restore_bytes(snapshot: dict):
+    """Откат файлов к прежнему содержимому (None — файла не было)."""
+    for path, raw in snapshot.items():
+        try:
+            if raw is None:
+                if os.path.exists(path):
+                    os.unlink(path)
+            else:
+                with open(path, "wb") as f:
+                    f.write(raw)
+        except OSError as e:
+            print(f"Не удалось откатить {path}: {e}")
+
+
+def build_game_teams(team_names, written: list, registry: dict) -> list:
+    """Составы игры для архива: у каждого игрока — его голы и передачи именно в этой игре и постоянный pid."""
+    by = {norm_key(n): (n, gl, a) for n, gl, a in written}
+    teams = []
+    for team in team_names:
+        row = []
+        for raw in team:
+            name, gl, a = by.get(norm_key(raw), (raw, 0, 0))
+            key = find_key(name, registry["players"])
+            row.append({"name": name, "pid": registry["players"][key].get("pid") if key else None,
+                        "goals": gl, "assists": a})
+        teams.append(row)
+    return teams
+
+
+def record_match_full(players: list, teams=None, date: str | None = None):
+    """Записывает игру (весь вечер): статистику игроков и номер в журнале игр.
+    players — [(имя, голы, передачи)]; teams — фактические составы (список списков имён) или None.
+    Возвращает (записанные, игра). DataCorrupted — ничего не записано. Если не удалось записать журнал —
+    статистика откатывается: либо записано всё, либо ничего."""
+    games = load_games()                       # строго и ДО любых изменений
     stats = load_stats()
-    registered = set(load_players()["players"])
+    registry = load_players()
+    registered = set(registry["players"])
     chat = stats.setdefault(str(CHAT_ID), {"players": {}, "last": []})
     written = []
     for name, goals, assists in players:
@@ -347,8 +478,36 @@ def record_match(players: list) -> list:
         rec["assists"] = rec.get("assists", 0) + assists
         written.append((cname, goals, assists))
     chat["last"] = [list(p) for p in written]
+    snapshot = {STATS_FILE: _read_bytes(STATS_FILE)}
     save_stats(stats)
-    return written
+    try:
+        split = bool(teams)
+        game_teams = build_game_teams(teams if split else [[n for n, _, _ in written]], written, registry)
+        game = {"number": next_game_number(games), "date": date or game_date_now(), "teams": game_teams,
+                "split": split, "source": "result" if split else "text", "recorded_at": now_iso()}
+        games["games"].append(game)
+        save_games(games)
+    except BaseException:
+        _restore_bytes(snapshot)
+        raise
+    return written, game
+
+
+def record_match(players: list, teams=None, date: str | None = None) -> list:
+    return record_match_full(players, teams, date)[0]
+
+
+def annul_last_game(games: dict):
+    """Отмена последней записанной игры (/отменить): номер освобождается только для самой последней игры,
+    запись остаётся в games["annulled"] для аудита. Прежние игры №1–4 (historical) не аннулируются."""
+    if not games["games"]:
+        return None
+    last = max(games["games"], key=lambda g: g["number"])
+    if last.get("source") == "historical":
+        return None
+    games["games"].remove(last)
+    games["annulled"].append({**last, "annulled_at": now_iso()})
+    return last
 
 
 def calc_payment_per_player(total: int, n: int) -> int:
@@ -534,7 +693,33 @@ def _seed_players() -> dict:
         rec = players.setdefault(name, {"usernames": [], "ids": [], "aliases": []})
         if display not in rec["aliases"]:
             rec["aliases"].append(display)
-    return {"version": 1, "players": players}
+    data = {"version": 1, "players": players}
+    ensure_pids(data)
+    return data
+
+
+def ensure_pids(data: dict) -> bool:
+    """Каждому игроку — постоянный внутренний pid (не меняется при смене имени/username). True — что-то присвоено."""
+    players = data["players"]
+    used = [rec["pid"] for rec in players.values() if isinstance(rec.get("pid"), int) and not isinstance(rec.get("pid"), bool)]
+    nxt = max([data.get("next_pid", 1) - 1] + used) + 1
+    changed = False
+    for rec in players.values():
+        if not isinstance(rec.get("pid"), int) or isinstance(rec.get("pid"), bool):
+            rec["pid"] = nxt
+            nxt += 1
+            changed = True
+    if data.get("next_pid") != nxt:
+        data["next_pid"] = nxt
+        changed = True
+    return changed
+
+
+def player_by_pid(data: dict, pid: int):
+    for name, rec in data["players"].items():
+        if rec.get("pid") == pid:
+            return name, rec
+    return None, None
 
 
 def validate_players(data):
@@ -547,6 +732,9 @@ def validate_players(data):
             rec.setdefault(field, [])
             if not isinstance(rec[field], list):
                 raise ValueError(f"игрок {name!r}: поле {field} не список")
+    pids = [rec["pid"] for rec in data["players"].values() if "pid" in rec]
+    if any(not isinstance(x, int) or isinstance(x, bool) for x in pids) or len(pids) != len(set(pids)):
+        raise ValueError("pid игроков некорректны или повторяются")
 
 
 def load_players() -> dict:
@@ -560,6 +748,12 @@ def load_players() -> dict:
         validate_players(data)
     except ValueError as e:
         raise DataCorrupted(PLAYERS_FILE, str(e))
+    if ensure_pids(data):          # совместимое дополнение старого файла: статистика и имена не меняются
+        try:
+            save_players(data)
+            print("players.json: игрокам присвоены постоянные ID")
+        except Exception as e:
+            print(f"Не удалось сохранить ID игроков: {e}")
     return data
 
 
@@ -608,7 +802,9 @@ def players_add(name: str, username: str | None = None) -> str:
     data = load_players()
     if find_key(name, data["players"]):
         raise ValueError(f"Игрок «{find_key(name, data['players'])}» уже есть.")
-    data["players"][name] = {"usernames": [clean_username(username)] if username else [], "ids": [], "aliases": []}
+    data["players"][name] = {"usernames": [clean_username(username)] if username else [], "ids": [], "aliases": [],
+                             "pid": data["next_pid"]}
+    data["next_pid"] += 1
     save_players(data)
     return name
 
@@ -641,6 +837,122 @@ def players_bind(name: str, username: str | None = None, user_id=None, alias: st
             rec["aliases"].append(a)
     save_players(data)
     return key
+
+
+def clean_player_name(raw: str) -> str:
+    name = re.sub(r"\s+", " ", raw.strip())
+    if not name or "\n" in raw.strip():
+        raise ValueError("Имя должно быть в одну строку и не пустым.")
+    if len(name) > 60 or name.startswith("/"):
+        raise ValueError("Слишком длинное имя (до 60 символов) или оно начинается с «/».")
+    return name
+
+
+def _rename_json(obj, old: str, new: str):
+    """Заменяет имя во всех строках и ключах структуры (состав, голы, история замен и т.д.), без учёта регистра и ё/е."""
+    key = norm_key(old)
+    if isinstance(obj, str):
+        return new if norm_key(obj) == key else obj
+    if isinstance(obj, list):
+        return [_rename_json(x, old, new) for x in obj]
+    if isinstance(obj, dict):
+        return {(new if isinstance(k, str) and norm_key(k) == key else k): _rename_json(v, old, new) for k, v in obj.items()}
+    return obj
+
+
+def players_rename(pid: int, new_raw: str) -> tuple:
+    """Меняет имя игрока, НЕ создавая нового: pid остаётся прежним, статистика, текущий и архивные составы и
+    журнал игр переносятся на новое имя. Либо меняется всё, либо ничего (при сбое файлы возвращаются)."""
+    new = clean_player_name(new_raw)
+    data = load_players()
+    old, rec = player_by_pid(data, pid)
+    if old is None:
+        raise ValueError("Игрок не найден (возможно, уже удалён).")
+    if new == old:
+        raise ValueError("Имя не изменилось.")
+    stats = load_stats()
+    games = load_games()
+    if norm_key(new) != norm_key(old):                         # смена только регистра/«ё» — тот же человек
+        clash = find_key(new, data["players"])
+        if clash:
+            raise ValueError(f"Игрок «{clash}» уже есть в списке. Чтобы объединить записи, используйте /переименовать.")
+        clash = find_key(new, stats_players_of(stats))
+        if clash:
+            raise ValueError(f"В статистике уже есть «{clash}». Чтобы объединить записи, используйте /переименовать.")
+    snapshot = {path: _read_bytes(path) for path in
+                (STATS_FILE, GAME_FILE, GAME_ARCHIVE_FILE, POLL_STATE_FILE, GAMES_FILE, PLAYERS_FILE)}
+    try:
+        chat = stats.get(str(CHAT_ID))
+        if chat:
+            skey = find_key(old, chat["players"])
+            if skey:
+                chat["players"] = {(new if k == skey else k): v for k, v in chat["players"].items()}
+            for entry in chat.get("last", []):
+                if norm_key(entry[0]) == norm_key(old):
+                    entry[0] = new
+            save_stats(stats)
+        changed = False
+        for game in games["games"]:
+            for team in game.get("teams") or []:
+                for pl in team:
+                    if pl.get("pid") == pid or (pl.get("pid") is None and norm_key(pl["name"]) == norm_key(old)):
+                        pl["name"], pl["pid"] = new, pid
+                        changed = True
+        if changed:
+            save_games(games)
+        for path in (GAME_FILE, GAME_ARCHIVE_FILE, POLL_STATE_FILE):
+            if os.path.exists(path):
+                obj = load_json(path, None)
+                if obj is not None:
+                    renamed = _rename_json(obj, old, new)
+                    if renamed != obj:
+                        save_json(path, renamed)
+        data["players"] = {(new if k == old else k): v for k, v in data["players"].items()}
+        save_players(data)
+    except BaseException:
+        _restore_bytes(snapshot)
+        raise
+    return old, new
+
+
+def players_set_usernames(pid: int, raw: str) -> list:
+    """Заменяет username игрока («-» — убрать все). Дубликат у другого игрока не допускается."""
+    data = load_players()
+    name, rec = player_by_pid(data, pid)
+    if name is None:
+        raise ValueError("Игрок не найден (возможно, уже удалён).")
+    raw = raw.strip()
+    if raw in ("-", "—", "нет"):
+        usernames = []
+    else:
+        usernames = [clean_username(x) for x in re.split(r"[\s,;]+", raw) if clean_username(x)]
+        if not usernames:
+            raise ValueError("Не понял username. Пример: @ivanov")
+        for u in usernames:
+            if not re.fullmatch(r"[A-Za-z0-9_\-]{3,}", u):
+                raise ValueError(f"«{u}» не похож на username (латиница, цифры, _; от 3 символов).")
+            for other, orec in data["players"].items():
+                if other != name and u.lower() in (x.lower() for x in orec["usernames"]):
+                    raise ValueError(f"@{u} уже привязан к игроку «{other}».")
+    rec["usernames"] = usernames
+    save_players(data)
+    return usernames
+
+
+def players_set_aliases(pid: int, raw: str) -> list:
+    """Заменяет отображаемые имена игрока в Telegram (по ним узнаётся проголосовавший без username); «-» — убрать."""
+    data = load_players()
+    name, rec = player_by_pid(data, pid)
+    if name is None:
+        raise ValueError("Игрок не найден (возможно, уже удалён).")
+    raw = raw.strip()
+    clear = raw in ("-", "—", "нет")
+    aliases = [] if clear else [a.strip().lower() for a in re.split(r"[,;\n]", raw) if a.strip()]
+    if not clear and not aliases:
+        raise ValueError("Не понял отображаемое имя. Пример: Миша В.")
+    rec["aliases"] = aliases
+    save_players(data)
+    return aliases
 
 
 # ============================================================
@@ -1006,6 +1318,10 @@ HELP_SECTIONS = {
         "/игрок удалить Фамилия И.\n"
         "/игрок username Фамилия И. @новый — добавить ещё один username\n"
         "/привязать @username = Фамилия И. — привязать аккаунт\n\n"
+        "Редактирование: «👥 Игроки» → «✏️ Редактировать игрока» → выбрать игрока → «✏️ Имя», «🔗 Username» "
+        "(заменить; «-» убрать) или «🏷 Отображаемое имя». У игрока есть постоянный внутренний номер: смена имени "
+        "НЕ создаёт нового игрока — статистика, игры, голы, передачи и составы прошлых игр остаются у него. Если новое имя "
+        "уже занято, бот откажет (объединить — /переименовать).\n\n"
         "Пример: /игрок добавить Иванов П. @ivanov\n\n"
         "Ограничения: удаление игрока не трогает его статистику. Имена сравниваются без учёта "
         "регистра и «ё/е»."
@@ -1037,7 +1353,9 @@ HELP_SECTIONS = {
         "«❌ Отмена» ничего не записывает.\n\n"
         "Резервный текстовый способ: /матч Иванов 2+1, Петров 0+3, Соломин — «голы+передачи», игрок без "
         "цифр записывается как 0+0. Эта команда доступна и участникам общего чата.\n\n"
-        "Отмена: /отменить убирает последнюю записанную игру (одну).\n\n"
+        "Каждая записанная игра (весь футбольный вечер) получает постоянный номер: «Игра №5 — 12.10.2026». Номер "
+        "дают только фактически записанному вечеру; отменённый вечер не нумеруется. История игр — «📚 История игр» (/история).\n"
+        "Отмена: /отменить убирает последнюю записанную игру (одну) и освобождает её номер; игры №1–4 номер не теряют.\n\n"
         "Ограничения: результат одного состава записывается один раз — повтор блокируется; если состав "
         "изменился, ввод идёт уже по новому. Гость после записи попадает в статистику под своим именем; "
         "регистр и «ё/е» не создают дублей."
@@ -1045,13 +1363,27 @@ HELP_SECTIONS = {
     "stats": (
         "📊 СТАТИСТИКА\n\n"
         "/статистика (/stats) — таблица: И — игры, Г — голы, П — передачи, О — очки (гол = 2, "
-        "передача = 1), К — коэффициент = очки / игры.\n\n"
+        "передача = 1), К — коэффициент = очки / игры. В заголовке — «сыграно игр: N»: сколько состоявшихся "
+        "футбольных вечеров (число из журнала игр, не из строк таблицы).\n"
+        "В личке под таблицей кнопка «📢 Опубликовать в общий чат»: бот публикует ту же актуальную статистику от своего "
+        "имени. Одна версия статистики публикуется один раз (затем кнопка «✅ Опубликовано»); изменилась статистика — "
+        "откройте её заново.\n\n"
         "/переименовать Старое = Новое — объединяет записи игрока (например, после смены написания).\n"
         "/обнулить да — стирает всю статистику (без слова «да» не сработает).\n\n"
         "Защита: запись атомарная; перед изменением делается копия в /data/backups (последние 40). "
         "Если stats.json повреждён или непонятен, бот НЕ считает его пустым: изменяющие операции "
         "останавливаются, файл сохраняется, вам приходит сообщение об ошибке.\n\n"
-        "Ограничения: статистика общая на один чат; истории по датам нет, кроме одной последней игры для /отменить."
+        "Ограничения: статистика общая на один чат; /обнулить стирает статистику, но не журнал игр."
+    ),
+    "history": (
+        "📚 ИСТОРИЯ ИГР\n\n"
+        "Кнопка «📚 История игр» в панели или /история (только у вас в личке). Список состоявшихся игр, новые сверху: "
+        "«Игра №4 — 28.09.2026». При выборе игры — составы всех команд именно той игры и возле каждого игрока ⚽ его голы "
+        "и 🎯 передачи в этой игре. Общей статистики и счёта отдельных матчей там нет.\n\n"
+        "Игры №1–4 (07.09, 14.09, 21.09, 28.09.2026) заведены по датам; их составы и голы в проекте не сохранялись и не "
+        "выдумываются. Начиная с №5 архив пополняется при записи результата («⚽ Внести результат матча» или /матч). "
+        "Журнал хранится в /data/games.json.\n\n"
+        "Ограничения: игра, записанная через /матч, показывается списком игроков без деления на команды."
     ),
     "pay": (
         "💰 ОПЛАТА\n\n"
@@ -1075,13 +1407,13 @@ HELP_SECTIONS = {
         "При каждом запуске бот присылает вам сообщение «🟢 Мяч запущен» с состоянием статистики, "
         "игроков и меню.\n\n"
         "Данные в /data: stats.json (статистика), players.json (игроки), poll_state.json (опрос и голоса), "
-        "game.json / game_archive.json (фактический состав), guests.json, backups/.\n\n"
+        "game.json / game_archive.json (фактический состав), games.json (журнал игр с номерами), guests.json, backups/.\n\n"
         "Правило: любая новая admin-функция добавляется в этот Help в том же изменении."
     ),
 }
 HELP_TITLES = {
     "poll": "🗳 Опрос", "players": "👥 Игроки", "split": "⚖️ Составы", "match": "⚽ Матч",
-    "stats": "📊 Статистика", "pay": "💰 Оплата", "misc": "🔧 Служебные",
+    "stats": "📊 Статистика", "history": "📚 История игр", "pay": "💰 Оплата", "misc": "🔧 Служебные",
 }
 HELP_ALL_TEXT = "\n".join(HELP_SECTIONS.values())
 
@@ -1196,7 +1528,8 @@ def main_panel() -> types.InlineKeyboardMarkup:
         [btn("🗳 Опрос", "m:poll"), btn("👥 Игроки", "m:players")],
         [btn("⚖️ Составы (разделить)", "m:split"), btn("⚙️ Изменить состав", "m:squad")],
         [btn("⚽ Внести результат матча", "m:result"), btn("💰 Рассчитать оплату", "m:pay")],
-        [btn("📊 Статистика", "m:stats"), btn("❓ Help", "m:help")],
+        [btn("📊 Статистика", "m:stats"), btn("📚 История игр", "m:history")],
+        [btn("❓ Help", "m:help")],
     ])
 
 
@@ -1310,7 +1643,9 @@ async def cb_panel(query: types.CallbackQuery):
     elif action == "pay":
         await show_payment(query)
     elif action == "stats":
-        await send_stats(query.message.answer)
+        await send_stats(query.message.answer, owner=True)
+    elif action == "history":
+        await show_history_list(query, 0)
     elif action == "poll":
         if poll_done_today(datetime.datetime.now(YEKB_TZ).date()):
             note = "\n\n⚠️ Опрос на сегодня уже создан. Создать ещё один?"
@@ -1357,7 +1692,8 @@ def sorted_player_names(data: dict) -> list:
 def players_markup() -> types.InlineKeyboardMarkup:
     return kb([
         [btn("➕ Добавить игрока", "pl:add"), btn("🔗 Привязать username", "pl:bind")],
-        [btn("🗑 Удалить игрока", "pl:del"), btn("⬅️ Меню", "m:home")],
+        [btn("✏️ Редактировать игрока", "pl:ed"), btn("🗑 Удалить игрока", "pl:del")],
+        [btn("⬅️ Меню", "m:home")],
     ])
 
 
@@ -1395,6 +1731,9 @@ async def cb_players(query: types.CallbackQuery):
             AWAITING[OWNER_ID] = {"kind": "bind_username", "name": name}
             await edit_or_send(query, f"Отправьте @username для «{name}». Отмена — /отмена.",
                                kb([[btn("⬅️ К игрокам", "m:players")]]))
+        elif action == "ed":
+            buttons = [btn(n, f"pe:c:{data['players'][n]['pid']}") for n in names]
+            await edit_or_send(query, "Кого редактировать?", kb(chunk_rows(buttons, 2) + [[btn("⬅️ Назад", "m:players")]]))
         elif action == "del":
             await edit_or_send(query, "Кого удалить из списка игроков? (статистика останется)",
                                picker_markup(names, "pl:dp", "m:players"))
@@ -1420,6 +1759,146 @@ async def cmd_players(message: types.Message):
         await message.answer(players_text(load_players()), reply_markup=players_markup())
     except DataCorrupted as e:
         await report_data_error(e, message=message)
+
+
+def player_card_text(data: dict, stats: dict, pid: int):
+    name, rec = player_by_pid(data, pid)
+    if name is None:
+        return None
+    st = stats_players_of(stats)
+    skey = find_key(name, st)
+    lines = [f"✏️ {name}", "",
+             "Username: " + (", ".join("@" + u for u in rec["usernames"]) or "не указан"),
+             "Отображаемые имена: " + (", ".join(f"«{a}»" for a in rec["aliases"]) or "нет")]
+    if skey:
+        r_ = st[skey]
+        lines.append(f"Статистика: игр {r_.get('games', 0)}, голов {r_.get('goals', 0)}, передач {r_.get('assists', 0)}")
+    lines += ["", "Статистика, игры и история сохраняются при любых изменениях — игрок остаётся тем же."]
+    return "\n".join(lines)
+
+
+def player_card_markup(pid: int) -> types.InlineKeyboardMarkup:
+    return kb([
+        [btn("✏️ Имя", f"pe:n:{pid}"), btn("🔗 Username", f"pe:u:{pid}")],
+        [btn("🏷 Отображаемое имя", f"pe:a:{pid}")],
+        [btn("⬅️ К игрокам", "m:players")],
+    ])
+
+
+@dp.callback_query(F.data.startswith("pe:"))
+async def cb_player_edit(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    parts = query.data.split(":")
+    action, pid = parts[1], int(parts[2])
+    try:
+        data = load_players()
+        name, _ = player_by_pid(data, pid)
+        if name is None:
+            await query.answer("Игрок не найден", show_alert=True)
+            return
+        cancel = kb([[btn("⬅️ К карточке", f"pe:c:{pid}")]])
+        if action == "c":
+            AWAITING.pop(OWNER_ID, None)
+            await edit_or_send(query, player_card_text(data, load_stats(), pid), player_card_markup(pid))
+        elif action == "n":
+            AWAITING[OWNER_ID] = {"kind": "edit_name", "pid": pid}
+            await edit_or_send(query, f"Введите новое имя для «{name}».\nНапример: Иванов П.\n\n"
+                                      "Статистика и история игр сохранятся. Отмена — /отмена.", cancel)
+        elif action == "u":
+            AWAITING[OWNER_ID] = {"kind": "edit_username", "pid": pid}
+            await edit_or_send(query, f"Введите username для «{name}».\nНапример: @ivanov\n"
+                                      "Несколько — через пробел; «-» — убрать все. Отмена — /отмена.", cancel)
+        elif action == "a":
+            AWAITING[OWNER_ID] = {"kind": "edit_alias", "pid": pid}
+            await edit_or_send(query, f"Введите отображаемое имя «{name}» в Telegram (так он подписан в чате).\n"
+                                      "Например: Миша В.\nНесколько — через запятую; «-» — убрать все. Отмена — /отмена.", cancel)
+    except DataCorrupted as e:
+        return await report_data_error(e, query=query)
+    await ack(query)
+
+
+# ---- история игр -----------------------------------------------------------
+
+HISTORY_PAGE = 10
+
+
+def game_view_text(game: dict, registry: dict) -> str:
+    """Архив конкретной игры: составы и голы/передачи каждого именно в этой игре. Без счёта матчей и общей статистики."""
+    lines = [f"⚽ {game_title(game)}", ""]
+    teams = game.get("teams")
+    if not teams:
+        lines.append("Составы и индивидуальная статистика этой игры не сохранялись (игра состоялась до ведения истории).")
+        return "\n".join(lines)
+    by_pid = {rec.get("pid"): name for name, rec in registry["players"].items()}
+    split = game.get("split", True)
+    if not split:
+        lines.append("Игроки (деление на команды при записи не указывалось):")
+    for i, team in enumerate(teams):
+        if split:
+            if i:
+                lines.append("")
+            lines.append(f"{TEAM_ICONS[i % len(TEAM_ICONS)]} Команда {i + 1} ({TEAM_COLORS[i % len(TEAM_COLORS)]})")
+        for pl in team:
+            name = by_pid.get(pl.get("pid")) or pl["name"]
+            lines.append(f"{name} — ⚽ {pl.get('goals', 0)} · 🎯 {pl.get('assists', 0)}")
+    return "\n".join(lines)
+
+
+def history_list_view(games: dict, page: int):
+    items = sorted(games["games"], key=lambda g: g["number"], reverse=True)
+    pages = max(1, (len(items) + HISTORY_PAGE - 1) // HISTORY_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = items[page * HISTORY_PAGE:(page + 1) * HISTORY_PAGE]
+    lines = [f"📚 История игр — сыграно: {len(items)}", "", *[game_title(g) for g in chunk]]
+    rows = [[btn(game_title(g), f"gh:g:{g['number']}")] for g in chunk]
+    nav = []
+    if page > 0:
+        nav.append(btn("◀️", f"gh:l:{page - 1}"))
+    if page < pages - 1:
+        nav.append(btn("▶️", f"gh:l:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([btn("⬅️ Меню", "m:home")])
+    return "\n".join(lines), kb(rows)
+
+
+async def show_history_list(query, page: int):
+    try:
+        text, markup = history_list_view(load_games(), page)
+    except DataCorrupted as e:
+        return await report_data_error(e, query=query)
+    await edit_or_send(query, text, markup)
+
+
+@dp.callback_query(F.data.startswith("gh:"))
+async def cb_history(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    parts = query.data.split(":")
+    try:
+        if parts[1] == "l":
+            await show_history_list(query, int(parts[2]))
+        else:
+            games = load_games()
+            game = next((g for g in games["games"] if g["number"] == int(parts[2])), None)
+            if game is None:
+                return await query.answer("Игра не найдена", show_alert=True)
+            await edit_or_send(query, game_view_text(game, load_players()), kb([[btn("⬅️ К истории", "gh:l:0"), btn("⬅️ Меню", "m:home")]]))
+    except DataCorrupted as e:
+        return await report_data_error(e, query=query)
+    await ack(query)
+
+
+@dp.message(Command("история", "history"))
+async def cmd_history(message: types.Message):
+    if not is_owner_private(message):
+        return
+    try:
+        text, markup = history_list_view(load_games(), 0)
+    except DataCorrupted as e:
+        return await report_data_error(e, message=message)
+    await message.answer(text, reply_markup=markup)
 
 
 PLAYER_USAGE = (
@@ -1522,6 +2001,19 @@ async def owner_text_input(message: types.Message):
             await bind_voter(st["voter"], name)
             await message.answer(f"✅ Игрок «{name}» создан и привязан.")
             await do_split(message.answer)
+        elif kind in ("edit_name", "edit_username", "edit_alias"):
+            pid = st["pid"]
+            if kind == "edit_name":
+                old, new = players_rename(pid, text)
+                note = f"✅ «{old}» → «{new}». Статистика и история игр сохранены, дубля нет."
+            elif kind == "edit_username":
+                names = players_set_usernames(pid, text)
+                note = "✅ Username: " + (", ".join("@" + u for u in names) or "убран")
+            else:
+                names = players_set_aliases(pid, text)
+                note = "✅ Отображаемые имена: " + (", ".join(f"«{a}»" for a in names) or "убраны")
+            await message.answer(f"{note}\n\n" + player_card_text(load_players(), load_stats(), pid),
+                                 reply_markup=player_card_markup(pid))
         elif kind == "squad_guest":
             await handle_squad_guest_text(message, st, text)
     except DataCorrupted as e:
@@ -2044,15 +2536,16 @@ async def cb_result(query: types.CallbackQuery):
                 if not g.get("result") or set(g["result"]["roster"]) != set(game_players(g)):
                     return await query.answer("Состав изменился — откройте ввод заново.", show_alert=True)
                 entries = result_entries(g)
-                written = record_match(entries)
+                written, game = record_match_full(entries, teams=g["teams"])
                 g["result_recorded"] = True
+                g["game_number"] = game["number"]
                 g["recorded_at"] = now_iso()
                 g["recorded"] = [list(w) for w in written]
                 save_game(g)
             scorers = [f"{n} {gl}+{a}" for n, gl, a in written if gl or a]
             await edit_or_send(
                 query,
-                f"✅ Матч записан ({len(written)} игроков).\n" + ("Результативные: " + ", ".join(scorers) if scorers else "Голов и передач нет."),
+                f"✅ Матч записан ({len(written)} игроков) — {game_title(game)}.\n" + ("Результативные: " + ", ".join(scorers) if scorers else "Голов и передач нет."),
                 kb([[btn("💰 Рассчитать оплату", "pm:menu")], [btn("⬅️ Меню", "m:home")]]),
             )
     except DataCorrupted as e:
@@ -2173,19 +2666,11 @@ async def cmd_payment_callback(query: types.CallbackQuery):
 # Статистика и прочие текстовые команды
 # ============================================================
 
-async def send_stats(answer):
-    try:
-        chat_stats = stats_players_of(load_stats())
-    except DataCorrupted as e:
-        print(f"[DATA ERROR] {e}")
-        return await answer("⚠️ Статистика сейчас недоступна (файл не читается). Администратор уведомлён.")
-    if not chat_stats:
-        await answer("Статистики пока нет.\nДобавьте игру: /матч Иванов 2+1")
-        return
+def stats_text(chat_stats: dict, games_played: int) -> str:
     rows = [(koef_of(r), points_of(r), name, r) for name, r in chat_stats.items()]
     rows.sort(reverse=True)
     lines = [
-        "📊 Статистика",
+        f"📊 Статистика (сыграно игр: {games_played})",
         "Гол = 2 очка, пас = 1 очко\n"
         "И — игры, Г — голы, П — пасы, О — очки, К — коэффициент\n"
     ]
@@ -2194,7 +2679,74 @@ async def send_stats(answer):
             f"{i}. {name} — И:{r.get('games', 0)} Г:{r.get('goals', 0)} П:{r.get('assists', 0)} "
             f"О:{fmt_num(pts)} К:{koef:.2f}"
         )
-    await answer("\n".join(lines))
+    return "\n".join(lines)
+
+
+def stats_snapshot():
+    """Актуальный текст статистики и его отпечаток (для кнопки публикации). None — статистики пока нет."""
+    chat_stats = stats_players_of(load_stats())
+    if not chat_stats:
+        return None, ""
+    text = stats_text(chat_stats, played_games_count())
+    return text, hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+
+
+def stats_publish_markup(token: str, published: bool) -> types.InlineKeyboardMarkup:
+    first = btn("✅ Опубликовано в общем чате", "noop") if published else btn("📢 Опубликовать в общий чат", f"sp:pub:{token}")
+    return kb([[first], [btn("⬅️ Меню", "m:home")]])
+
+
+async def send_stats(answer, owner: bool = False):
+    """owner=True — личный чат Дмитрия: под таблицей кнопка «Опубликовать в общий чат»."""
+    try:
+        text, token = stats_snapshot()
+    except DataCorrupted as e:
+        print(f"[DATA ERROR] {e}")
+        return await answer("⚠️ Статистика сейчас недоступна (файл не читается). Администратор уведомлён.")
+    if text is None:
+        await answer("Статистики пока нет.\nДобавьте игру: /матч Иванов 2+1")
+        return
+    if owner:
+        published = load_json(META_FILE, {}).get("stats_published_hash") == token
+        await answer(text, reply_markup=stats_publish_markup(token, published))
+    else:
+        await answer(text)
+
+
+@dp.callback_query(F.data.startswith("sp:"))
+async def cb_stats_publish(query: types.CallbackQuery):
+    """Публикация актуальной статистики в общий чат от имени бота. Только владелец в личке. Одна версия статистики
+    публикуется один раз (как составы): повторное нажатие не дублирует сообщение."""
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    token = query.data.split(":")[2]
+    async with PUBLISH_LOCK:
+        try:
+            text, current = stats_snapshot()
+        except DataCorrupted as e:
+            return await report_data_error(e, query=query)
+        if text is None or current != token:
+            return await query.answer("Статистика изменилась. Откройте «📊 Статистика» заново.", show_alert=True)
+        if load_json(META_FILE, {}).get("stats_published_hash") == current:
+            try:
+                await query.message.edit_reply_markup(reply_markup=stats_publish_markup(current, True))
+            except Exception:
+                pass
+            return await query.answer("Уже опубликовано")
+        try:
+            await bot.send_message(CHAT_ID, text)
+        except Exception as e:
+            print(f"Не удалось опубликовать статистику: {e}")
+            return await query.answer("❌ Не удалось отправить в общий чат. Можно повторить.", show_alert=True)
+        meta = load_json(META_FILE, {})
+        meta["stats_published_hash"] = current
+        meta["stats_published_at"] = now_iso()
+        save_json(META_FILE, meta)
+    try:
+        await query.message.edit_reply_markup(reply_markup=stats_publish_markup(current, True))
+    except Exception as e:
+        print(f"Не удалось обновить кнопку публикации статистики: {e}")
+    await query.answer("Опубликовано")
 
 
 @dp.message(Command("статистика", "stats"))
@@ -2206,7 +2758,7 @@ async def cmd_stats(message: types.Message):
     except DataCorrupted as e:
         await report_data_error(e, message=message)
         return
-    await send_stats(message.answer)
+    await send_stats(message.answer, owner=is_owner_private(message))
 
 
 @dp.message(Command("матч"))
@@ -2226,13 +2778,14 @@ async def cmd_match(message: types.Message, command: CommandObject):
         await message.answer(f"Не понял игроков.\n{usage}")
         return
     try:
-        written = record_match(players)
+        written, game = record_match_full(players)
     except DataCorrupted as e:
         await report_data_error(e, message=message)
         return
     lines = [f"Записал игру ({len(written)} чел.):"]
     for name, g, a in written:
         lines.append(f"• {name}: {g}+{a}")
+    lines.append(f"\n{game_title(game)}")
     if errors:
         lines.append(f"\nНе разобрал: {', '.join(errors)}")
     await message.answer("\n".join(lines))
@@ -2242,8 +2795,10 @@ async def cmd_match(message: types.Message, command: CommandObject):
 async def cmd_undo(message: types.Message):
     if not is_allowed(message, "отменить"):
         return
+    annulled = None
     try:
         stats = load_stats()
+        games = load_games()
         chat = stats.setdefault(str(target_chat(message)), {"players": {}, "last": []})
         last = chat.get("last") or []
         if not last:
@@ -2260,11 +2815,20 @@ async def cmd_undo(message: types.Message):
             if rec["games"] == 0 and rec["goals"] == 0 and rec["assists"] == 0:
                 chat["players"].pop(key, None)
         chat["last"] = []
+        snapshot = {STATS_FILE: _read_bytes(STATS_FILE)}
         save_stats(stats)
+        try:
+            annulled = annul_last_game(games)
+            if annulled:
+                save_games(games)
+        except BaseException:
+            _restore_bytes(snapshot)
+            raise
     except DataCorrupted as e:
         await report_data_error(e, message=message)
         return
-    await message.answer(f"Последняя игра отменена: {', '.join(p[0] for p in last)}")
+    tail = f"\nИгра №{annulled['number']} аннулирована (номер освобождён)." if annulled else ""
+    await message.answer(f"Последняя игра отменена: {', '.join(p[0] for p in last)}{tail}")
 
 
 @dp.message(Command("переименовать"))
@@ -2376,6 +2940,7 @@ OWNER_MENU_COMMANDS = [
     ("result", "Внести результат матча"),
     ("pay", "Рассчитать оплату"),
     ("stats", "Показать статистику"),
+    ("history", "История игр"),
     ("players", "Игроки и привязки"),
     ("help", "Help — инструкция администратора"),
 ]
@@ -2441,6 +3006,12 @@ def storage_report() -> list:
         lines.append(f"👥 Игроки: OK, {len(data['players'])}")
     except DataCorrupted as e:
         lines.append(f"⚠️ Игроки НЕ читаются ({e.reason})")
+    try:
+        games = load_games()
+        last = max(games["games"], key=lambda g: g["number"]) if games["games"] else None
+        lines.append(f"🎮 Игры: сыграно {len(games['games'])}" + (f", последняя {game_title(last)}" if last else ""))
+    except DataCorrupted as e:
+        lines.append(f"⚠️ Журнал игр НЕ читается ({e.reason})")
     return lines
 
 

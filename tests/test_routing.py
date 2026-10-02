@@ -86,7 +86,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.patches = []
         paths = {"STATS_FILE": "stats.json", "LAST_POLL_FILE": "last_poll.txt", "POLL_STATE_FILE": "poll_state.json",
                  "GUESTS_FILE": "guests.json", "PLAYERS_FILE": "players.json", "GAME_FILE": "game.json",
-                 "GAME_ARCHIVE_FILE": "game_archive.json", "META_FILE": "ui_meta.json", "BACKUP_DIR": "backups"}
+                 "GAME_ARCHIVE_FILE": "game_archive.json", "GAMES_FILE": "games.json", "META_FILE": "ui_meta.json", "BACKUP_DIR": "backups"}
         for name, val in paths.items():
             p = mock.patch.object(B, name, os.path.join(self.tmp, val))
             p.start()
