@@ -3,6 +3,7 @@
 import datetime as real_dt
 import json
 import os
+import shutil
 import sys
 import unittest
 from unittest import mock
@@ -25,10 +26,10 @@ class GamesBase(Base):
         for name in ("Иванов И.", "Петров П.", "Сидоров С."):
             B.players_add(name, None) if name not in data["players"] else None
 
-    def record(self, teams=None, scores=None, date="2026-10-05"):
+    def record(self, teams=None, scores=None, date="2026-10-05", mode=None):
         scores = scores or {"Иванов И.": (2, 1), "Петров П.": (0, 2), "Сидоров С.": (1, 0)}
         entries = [(n, g, a) for n, (g, a) in scores.items()]
-        return B.record_match_full(entries, teams=teams or [["Иванов И.", "Сидоров С."], ["Петров П."]], date=date)
+        return B.record_match_full(entries, teams=teams or [["Иванов И.", "Сидоров С."], ["Петров П."]], date=date, mode=mode)
 
     async def stats_answer(self, owner=True):
         sent = []
@@ -89,7 +90,7 @@ class Numbering(GamesBase):
         # 2. Данные отменены (/отменить)
         m = owner_msg()
         await B.cmd_undo(m)
-        self.assertIn("Игра №5 остаётся за этим вечером", m.answers[-1][0])
+        self.assertIn("Игра №5 (05.10.2026) остаётся за этим вечером", m.answers[-1][0])
         self.assertIn("не освобождается", m.answers[-1][0])
         ivan = self.read_stats()[str(CHAT)]["players"]["Иванов И."]
         self.assertEqual((ivan["goals"], ivan["games"]), (9, 4))                     # статистика откатилась
@@ -99,7 +100,7 @@ class Numbering(GamesBase):
         self.assertIsNotNone(g["teams_before_undo"])                                   # прежние данные не потеряны (аудит)
         self.assertEqual(B.played_games_count(), 5)                                    # номер за этим вечером сохранён
         # 3. Повторная запись исправленных данных этого же вечера — снова Игра №5
-        _, again = self.record(scores={"Иванов И.": (2, 1), "Петров П.": (0, 2), "Сидоров С.": (1, 0)}, date="2026-10-06")
+        _, again = self.record(scores={"Иванов И.": (2, 1), "Петров П.": (0, 2), "Сидоров С.": (1, 0)}, date="2026-10-06", mode=5)
         self.assertEqual(again["number"], 5)
         self.assertEqual(again["date"], "2026-10-05")                                  # дата вечера прежняя
         self.assertNotIn("status", again)
@@ -118,7 +119,7 @@ class Numbering(GamesBase):
         _, g5 = self.record(date="2026-10-05")
         await B.cmd_undo(owner_msg())                          # данные игры №5 отменены и так и не введены заново
         # через неделю — другой футбольный вечер: он обязан получить №6, а не вернуть №5
-        _, other = self.record(date="2026-10-12")
+        _, other = self.record(date="2026-10-12", mode="new")
         self.assertEqual(other["number"], 6)
         games = B.load_games()["games"]
         five = [x for x in games if x["number"] == 5][0]
@@ -127,15 +128,70 @@ class Numbering(GamesBase):
         numbers = [x["number"] for x in games]
         self.assertEqual(len(numbers), len(set(numbers)))
 
-    async def test_reentry_window_is_shorter_than_a_week(self):
+    async def test_correction_after_more_than_3_days_is_still_the_same_game(self):
+        """Никаких сроков: исправление через 1, 3, 4, 9 и 40 дней — всё та же Игра №5 с прежней датой."""
+        for days_later in (1, 3, 4, 9, 40):
+            for p in (B.STATS_FILE, B.GAMES_FILE, B.PLAYERS_FILE):
+                if os.path.exists(p):
+                    os.unlink(p)
+            shutil.rmtree(B.BACKUP_DIR, ignore_errors=True)
+            self.setup_roster()
+            self.record(date="2026-10-05")
+            await B.cmd_undo(owner_msg())
+            late = (real_dt.date(2026, 10, 5) + real_dt.timedelta(days=days_later)).isoformat()
+            _, fixed = self.record(date=late, mode=5, scores={"Иванов И.": (3, 0), "Петров П.": (0, 0), "Сидоров С.": (0, 0)})
+            self.assertEqual((fixed["number"], fixed["date"]), (5, "2026-10-05"), days_later)
+            self.assertNotIn("status", fixed)
+            self.assertEqual(sorted(g["number"] for g in B.load_games()["games"]), [1, 2, 3, 4, 5])
+            ivan = self.read_stats()[str(CHAT)]["players"]["Иванов И."]
+            self.assertEqual((ivan["goals"], ivan["games"]), (12, 5))                   # исправленные данные учтены ровно один раз
+            _, nxt = self.record(date="2026-12-01")
+            self.assertEqual(nxt["number"], 6)
+
+    async def test_without_choice_nothing_is_recorded_and_bot_asks(self):
         self.setup_roster()
         self.record(date="2026-10-05")
         await B.cmd_undo(owner_msg())
-        _, same_week = self.record(date="2026-10-08")          # 3 дня — исправление того же вечера
-        self.assertEqual(same_week["number"], 5)
+        before = (read_bytes(B.STATS_FILE), read_bytes(B.GAMES_FILE))
+        with self.assertRaises(B.NeedGameChoice) as ctx:
+            self.record(date="2026-10-12")
+        self.assertEqual([g["number"] for g in ctx.exception.reverted], [5])
+        self.assertEqual(before, (read_bytes(B.STATS_FILE), read_bytes(B.GAMES_FILE)))
+        with self.assertRaises(ValueError):
+            self.record(mode=3)                                 # №3 не ждёт исправления
+
+    async def test_text_match_asks_then_fix_and_new_keywords(self):
+        self.setup_roster()
+        self.record(date="2026-10-05")
         await B.cmd_undo(owner_msg())
-        _, next_week = self.record(date="2026-10-12")          # 7 дней — новый вечер
-        self.assertEqual(next_week["number"], 6)
+        before = read_bytes(B.STATS_FILE)
+        m = owner_msg()
+        await B.cmd_match(m, cmd("матч", "Иванов И. 1+0"))
+        self.assertIn("/матч исправление 5", m.answers[-1][0])
+        self.assertIn("/матч новый", m.answers[-1][0])
+        self.assertIn("Игра №6", m.answers[-1][0])
+        self.assertEqual(before, read_bytes(B.STATS_FILE))
+        await B.cmd_match(m, cmd("матч", "исправление 5 Иванов И. 1+0, Петров П. 0+1"))
+        self.assertIn("Игра №5 — 05.10.2026", m.answers[-1][0])
+        await B.cmd_match(m, cmd("матч", "новый Иванов И. 2+0"))
+        self.assertIn("Игра №6 — ", m.answers[-1][0])
+        self.assertEqual(sorted(g["number"] for g in B.load_games()["games"]), [1, 2, 3, 4, 5, 6])
+
+    async def test_two_reverted_games_each_can_be_corrected_later(self):
+        self.setup_roster()
+        self.record(date="2026-10-05")
+        await B.cmd_undo(owner_msg())                                   # №5 отменена
+        self.record(date="2026-10-12", mode="new")                      # новый вечер №6
+        await B.cmd_undo(owner_msg())                                   # отменяется именно №6 (записана последней)
+        games = {g["number"]: g for g in B.load_games()["games"]}
+        self.assertEqual((games[5]["status"], games[6]["status"]), ("reverted", "reverted"))
+        _, fix5 = self.record(date="2026-12-24", mode=5)
+        _, fix6 = self.record(date="2026-12-24", mode=6)
+        self.assertEqual((fix5["number"], fix5["date"], fix6["number"], fix6["date"]), (5, "2026-10-05", 6, "2026-10-12"))
+        _, nxt = self.record(date="2026-12-28")
+        self.assertEqual(nxt["number"], 7)
+        numbers = [g["number"] for g in B.load_games()["games"]]
+        self.assertEqual(numbers, sorted(set(numbers)))
 
     async def test_undo_twice_and_historical_games_untouched(self):
         self.setup_roster()
@@ -181,7 +237,21 @@ class Numbering(GamesBase):
         self.assertFalse(B.load_game()["result_recorded"])                              # можно вводить заново той же кнопкой
         await B.cb_panel(FakeQuery("m:result"))
         await B.cb_result(FakeQuery("rs:g+:1"))
-        second = await confirm()
+        q = FakeQuery("rs:prev")
+        await B.cb_result(q)
+        ok = [d for d in all_button_data(q.message.edits[-1][1]) if d.startswith("rs:ok")][0]
+        q = FakeQuery(ok)
+        await B.cb_result(q)                                                           # есть отменённая игра: бот спрашивает
+        asked = q.message.edits[-1]
+        self.assertIn("Куда записать", asked[0])
+        datas = all_button_data(asked[1])
+        fix = [d for d in datas if d.startswith("rs:okf:")][0]
+        self.assertTrue(fix.endswith(":5"))
+        self.assertTrue(any(d.startswith("rs:okn:") for d in datas))
+        self.assertEqual(B.played_games_count(), 5)
+        q = FakeQuery(fix)
+        await B.cb_result(q)
+        second = q.message.edits[-1][0]
         self.assertIn("Игра №5", second)
         self.assertEqual(B.played_games_count(), 5)
 

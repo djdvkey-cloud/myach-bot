@@ -21,7 +21,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.client.session.aiohttp import AiohttpSession
 
-BOT_VERSION = "2026-10-03"
+BOT_VERSION = "2026-10-04"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -45,9 +45,6 @@ BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 GAMES_FILE = os.path.join(DATA_DIR, "games.json")        # журнал состоявшихся игр (футбольных вечеров) с постоянными номерами
 # Состоявшиеся игры №1–4: даты заданы Дмитрием. Составы и голы этих игр в проекте не сохранялись — не придумываются.
 HISTORICAL_GAMES = [(1, "2026-09-07"), (2, "2026-09-14"), (3, "2026-09-21"), (4, "2026-09-28")]
-# После /отменить игра сохраняет свой номер; исправленные данные того же вечера (в течение этих дней) получают тот же номер.
-# Следующий футбольный вечер — через 7 дней, поэтому окно короче недели.
-REENTRY_DAYS = 3
 BACKUP_KEEP = 40
 
 # Начальный список игроков. Используется ТОЛЬКО для первого создания
@@ -424,16 +421,12 @@ def next_game_number(data: dict) -> int:
     return max(used, default=0) + 1
 
 
-def reentry_target(games: dict, day: str):
-    """Игра, чьи данные отменены /отменить и которую теперь вводят заново (исправление того же вечера) — сохраняет свой номер.
-    Только самая последняя игра и только в пределах REENTRY_DAYS от её даты; иначе это уже другой вечер."""
-    if not games["games"]:
-        return None
-    last = max(games["games"], key=lambda g: g["number"])
-    if last.get("status") != "reverted":
-        return None
-    delta = (datetime.date.fromisoformat(day) - datetime.date.fromisoformat(last["date"])).days
-    return last if 0 <= delta <= REENTRY_DAYS else None
+class NeedGameChoice(Exception):
+    """Есть игры с отменёнными данными: при записи нужно явно выбрать — исправление этой игры или новый вечер."""
+
+    def __init__(self, reverted: list):
+        super().__init__("нужен выбор: исправление отменённой игры или новый вечер")
+        self.reverted = reverted
 
 
 def game_date_now() -> str:
@@ -489,12 +482,23 @@ def build_game_teams(team_names, written: list, registry: dict) -> list:
     return teams
 
 
-def record_match_full(players: list, teams=None, date: str | None = None):
+def record_match_full(players: list, teams=None, date: str | None = None, mode=None):
     """Записывает игру (весь вечер): статистику игроков и номер в журнале игр.
     players — [(имя, голы, передачи)]; teams — фактические составы (список списков имён) или None.
     Возвращает (записанные, игра). DataCorrupted — ничего не записано. Если не удалось записать журнал —
-    статистика откатывается: либо записано всё, либо ничего."""
+    статистика откатывается: либо записано всё, либо ничего.
+    mode: None — игр с отменёнными данными нет → новый номер; если они есть, нужно явное решение (NeedGameChoice):
+    "new" — новый вечер (следующий номер) или номер N отменённой игры — исправленные данные той же игры (прежние номер и дата),
+    сколько бы времени ни прошло."""
     games = load_games()                       # строго и ДО любых изменений
+    reverted = [g for g in games["games"] if g.get("status") == "reverted"]
+    target = None
+    if isinstance(mode, int) and not isinstance(mode, bool):
+        target = next((g for g in reverted if g["number"] == mode), None)
+        if target is None:
+            raise ValueError(f"Игра №{mode} не ждёт исправления.")
+    elif mode != "new" and reverted:
+        raise NeedGameChoice(reverted)
     stats = load_stats()
     registry = load_players()
     registered = set(registry["players"])
@@ -514,7 +518,7 @@ def record_match_full(players: list, teams=None, date: str | None = None):
         split = bool(teams)
         game_teams = build_game_teams(teams if split else [[n for n, _, _ in written]], written, registry)
         day = date or game_date_now()
-        game = reentry_target(games, day)
+        game = target
         fields = {"teams": game_teams, "split": split, "source": "result" if split else "text", "recorded_at": now_iso()}
         if game is not None:                    # исправленный ввод той же игры: прежний номер и дата
             for key in ("status", "reverted_at", "teams_before_undo"):
@@ -524,6 +528,7 @@ def record_match_full(players: list, teams=None, date: str | None = None):
         else:
             game = {"number": next_game_number(games), "date": day, **fields}
             games["games"].append(game)
+        games["last_recorded"] = game["number"]
         save_games(games)
     except BaseException:
         _restore_bytes(snapshot)
@@ -531,22 +536,22 @@ def record_match_full(players: list, teams=None, date: str | None = None):
     return written, game
 
 
-def record_match(players: list, teams=None, date: str | None = None) -> list:
-    return record_match_full(players, teams, date)[0]
+def record_match(players: list, teams=None, date: str | None = None, mode=None) -> list:
+    return record_match_full(players, teams, date, mode)[0]
 
 
 def revert_last_game(games: dict):
-    """/отменить: статистика откатывается, а игра ОСТАЁТСЯ в журнале со своим номером (status = reverted, данные убраны).
-    Номер больше никому не выдаётся: исправленный ввод того же вечера вернёт тот же номер (см. reentry_target).
-    Затрагивается только самая последняя игра; №1–4 (historical) данных не имеют и не меняются."""
-    candidates = [g for g in games["games"] if g.get("source") != "historical" and g.get("status") != "reverted"]
-    if not candidates:
-        return None
-    last = max(candidates, key=lambda g: g["number"])
-    if last["number"] != max(g["number"] for g in games["games"]):
+    """/отменить: статистика откатывается, а игра ОСТАЁТСЯ в журнале со своим номером и датой (status = reverted, данные убраны,
+    прежние — в teams_before_undo). Номер никому больше не выдаётся: исправленные данные можно записать в ту же игру в любое время
+    (см. record_match_full, mode). Отменяется игра, записанная последней (last_recorded); №1–4 (historical) не затрагиваются."""
+    candidates = {g["number"]: g for g in games["games"] if g.get("source") != "historical" and g.get("status") != "reverted"}
+    n = games.get("last_recorded")
+    last = candidates.get(n) if n is not None else (candidates[max(candidates)] if candidates else None)
+    if last is None:
         return None
     last["teams_before_undo"], last["teams"] = last.get("teams"), None
     last["status"], last["reverted_at"] = "reverted", now_iso()
+    games["last_recorded"] = None
     return last
 
 
@@ -1396,8 +1401,10 @@ HELP_SECTIONS = {
         "Каждая записанная игра (весь футбольный вечер) получает постоянный номер: «Игра №5 — 12.10.2026». Номер "
         "дают только фактически записанному вечеру; отменённый вечер не нумеруется. История игр — «📚 История игр» (/история).\n"
         "Отмена: /отменить убирает последнюю записанную игру (одну): статистика откатывается, но НОМЕР игры остаётся за этим вечером и никогда не переиспользуется. "
-        "Если данные вечера исправляют — введите их заново (в течение 3 дней): запишется та же Игра №N. "
-        "Следующий новый вечер получит следующий номер.\n\n"
+        "Исправленные данные этой игры можно записать в ту же Игра №N в любое время, без ограничения по срокам: когда есть отменённая игра, "
+        "при записи бот спрашивает — «✏️ Исправление» (та же Игра №N, прежние номер и дата) или «🆕 Новый вечер» (следующий номер); "
+        "для /матч — слова «исправление N» или «новый» (/матч исправление 5 Иванов 2+1; /матч новый Иванов 2+1). "
+        "Новый вечер получает следующий номер, номер отменённой игры никому не достаётся.\n\n"
         "Ограничения: результат одного состава записывается один раз — повтор блокируется; если состав "
         "изменился, ввод идёт уже по новому. Гость после записи попадает в статистику под своим именем; "
         "регистр и «ё/е» не создают дублей."
@@ -1870,8 +1877,8 @@ def game_view_text(game: dict, registry: dict) -> str:
     lines = [f"⚽ {game_title(game)}", ""]
     teams = game.get("teams")
     if game.get("status") == "reverted":
-        lines.append(f"⚠️ Данные этой игры отменены (/отменить). Номер сохранён за этим вечером; "
-                     f"исправленный ввод запишется как Игра №{game['number']}.")
+        lines.append(f"⚠️ Данные этой игры отменены (/отменить). Номер и дата сохранены за этим вечером; "
+                     f"исправленные данные можно записать как Игра №{game['number']} (выбор при записи результата).")
         return "\n".join(lines)
     if not teams:
         lines.append("Составы и индивидуальная статистика этой игры не сохранялись (игра состоялась до ведения истории).")
@@ -2550,7 +2557,7 @@ async def cb_result(query: types.CallbackQuery):
     if not g or not g.get("result"):
         await query.answer("Ввод результата устарел. Откройте заново.", show_alert=True)
         return
-    if g.get("result_recorded") and action != "ok":
+    if g.get("result_recorded") and action not in ("ok", "okn", "okf"):
         await query.answer("Результат уже записан.", show_alert=True)
         return
     try:
@@ -2573,7 +2580,7 @@ async def cb_result(query: types.CallbackQuery):
             g["result"] = None
             save_game(g)
             await edit_or_send(query, "Ввод результата отменён, статистика не менялась.", kb([[btn("⬅️ Меню", "m:home")]]))
-        elif action == "ok":
+        elif action in ("ok", "okn", "okf"):
             async with RECORD_LOCK:
                 g = load_game()
                 if not g or g["id"] != parts[2]:
@@ -2583,7 +2590,18 @@ async def cb_result(query: types.CallbackQuery):
                 if not g.get("result") or set(g["result"]["roster"]) != set(game_players(g)):
                     return await query.answer("Состав изменился — откройте ввод заново.", show_alert=True)
                 entries = result_entries(g)
-                written, game = record_match_full(entries, teams=g["teams"])
+                mode = "new" if action == "okn" else (int(parts[3]) if action == "okf" else None)
+                try:
+                    written, game = record_match_full(entries, teams=g["teams"], mode=mode)
+                except NeedGameChoice as need:          # есть отменённая игра: выбор делает Дмитрий, бот не угадывает
+                    rows = [[btn(f"✏️ Исправление: {game_title(x)}", f"rs:okf:{g['id']}:{x['number']}")] for x in need.reverted]
+                    rows.append([btn(f"🆕 Новый вечер (Игра №{next_game_number(load_games())})", f"rs:okn:{g['id']}")])
+                    rows.append([btn("✏️ Изменить", "rs:menu"), btn("❌ Отмена", "rs:cancel")])
+                    await ack(query)
+                    return await edit_or_send(
+                        query, "Есть игра, данные которой были отменены: " + ", ".join(game_title(x) for x in need.reverted)
+                        + ".\n\nКуда записать этот результат?\n• «Исправление» — те же номер и дата, статистика добавится один раз.\n"
+                        "• «Новый вечер» — следующий номер; отменённая игра сохранит свой номер.", kb(rows))
                 g["result_recorded"] = True
                 g["game_number"] = game["number"]
                 g["recorded_at"] = now_iso()
@@ -2815,17 +2833,36 @@ async def cmd_match(message: types.Message, command: CommandObject):
     usage = (
         "Формат:\n"
         "/матч Иванов 2+1, Петров 0+3, Соломин\n\n"
+        "Если есть игра с отменёнными данными, добавьте слово: «исправление N» (та же Игра №N) или «новый» (новый вечер).\n\n"
         "Гол = 2 очка, пас = 1 очко."
     )
     if not command.args:
         await message.answer(usage)
         return
-    players, errors = parse_match_line(command.args)
+    args, mode = command.args.strip(), None
+    m = re.match(r"^(?:новый|новая|new)\b\s*", args, re.IGNORECASE)
+    if m:
+        args, mode = args[m.end():], "new"
+    else:
+        m = re.match(r"^(?:исправление|исправить|fix)\s+(\d+)\s*", args, re.IGNORECASE)
+        if m:
+            args, mode = args[m.end():], int(m.group(1))
+    players, errors = parse_match_line(args)
     if not players:
         await message.answer(f"Не понял игроков.\n{usage}")
         return
     try:
-        written, game = record_match_full(players)
+        written, game = record_match_full(players, mode=mode)
+    except NeedGameChoice as need:
+        lines = ["Есть игра, данные которой были отменены. Укажите, куда записать результат:"]
+        for x in need.reverted:
+            lines.append(f"• исправление {game_title(x)}: /матч исправление {x['number']} Иванов 2+1, Петров 0+3")
+        lines.append(f"• новый вечер (Игра №{next_game_number(load_games())}): /матч новый Иванов 2+1, Петров 0+3")
+        await message.answer("\n".join(lines))
+        return
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}")
+        return
     except DataCorrupted as e:
         await report_data_error(e, message=message)
         return
@@ -2876,8 +2913,9 @@ async def cmd_undo(message: types.Message):
         return
     tail = ""
     if reverted:
-        tail = (f"\nИгра №{reverted['number']} остаётся за этим вечером: её номер не освобождается. Исправленные данные этого "
-                f"вечера, введённые в течение {REENTRY_DAYS} дней, запишутся как Игра №{reverted['number']}.")
+        tail = (f"\nИгра №{reverted['number']} ({fmt_game_date(reverted['date'])}) остаётся за этим вечером: её номер не освобождается "
+                f"и не достанется другому вечеру. Следующий результат бот запишет по вашему выбору: исправление Игры №{reverted['number']} "
+                f"(в любое время) или новый вечер.")
         g = load_game()                           # результат из кнопок можно ввести заново для той же игры
         if g and g.get("game_number") == reverted["number"] and g.get("result_recorded"):
             g["result_recorded"] = False
