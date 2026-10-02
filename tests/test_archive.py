@@ -279,10 +279,16 @@ class AlexandrIsMorgun(ArchiveBase):
         stats = totals_stats()
         stats["Alexandr"] = stats.pop("Моргун А.")            # как в production: статистика под именем Alexandr
         self.write_stats(stats)
-        data = B.load_players()                                  # начальный реестр содержит и Alexandr, и Моргун А.
+        data = B.load_players()
+        # Состояние production до закрепления: отдельная запись Alexandr (@Footmor, со статистикой) и, возможно, ещё одна запись
+        # «Моргун А.» от прежнего начального списка (с другим username).
+        legacy_pid = data["next_pid"]
+        data["players"]["Alexandr"] = {"usernames": ["Footmor"], "ids": [], "aliases": [], "pid": legacy_pid}
+        data["next_pid"] += 1
+        data["players"]["Моргун А."]["usernames"] = ["OldDuplicate"]
         if not with_duplicate:
             del data["players"]["Моргун А."]
-            B.save_players(data)
+        B.save_players(data)
         for name in ("Рим", "Антон от Миши"):
             if not B.find_key(name, B.load_players()["players"]):
                 B.players_add(name)

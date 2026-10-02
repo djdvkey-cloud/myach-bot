@@ -21,7 +21,11 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.client.session.aiohttp import AiohttpSession
 
-BOT_VERSION = "2026-10-06"
+# Версия = реальная дата деплоя (Екатеринбург, YYYY-MM-DD); несколько версий за день — последовательный суффикс (.1, .2 ...).
+# Будущие даты в номере не использовать. История: 2026-10-01 (меню, игроки в /data, фактический состав); 2026-10-02 (нумерация игр,
+# История игр, публикация статистики, редактирование игрока); 2026-10-03 … 2026-10-06 — версии с заранее проставленными датами
+# (архив игр №1–4, /отменить без освобождения номера); начиная с 2026-10-03.1 — по реальной дате деплоя.
+BOT_VERSION = "2026-10-03.1"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -83,12 +87,12 @@ DEFAULT_PLAYER_USERNAMES = {
     "Мирасов Г.": "girfanmir", "Лучинин А.": "LuchininAleksandr",
     "Вахобов Г.": "INVESTORGULOM", "Влад": "VladislavOAR",
     "Антон": "Siimma445", "IIvajan": "IvaJan", "D": "dadadaann",
-    "Alexandr": "Footmor", "Сикач И.": "tWoKizaa",
-    "Моргун А.": "Cptmorgun", "Калабин Д.": "dv_kalabin",
+    "Сикач И.": "tWoKizaa",
+    "Моргун А.": "Footmor", "Калабин Д.": "dv_kalabin",       # Моргун А. = @Footmor = прежний «Alexandr» (один игрок, подтверждено Дмитрием)
     "Чичин А.": "temachichin", "Расчётов А.": "go-go131",
 }
 DEFAULT_DISPLAY_ALIASES = {"михаил": "Волков М.", "вадим": "Большаков В.",
-                           "q": "Расчётов А.", "zakhar miakushko": "Мякушко З."}
+                           "q": "Расчётов А.", "zakhar miakushko": "Мякушко З.", "alexandr": "Моргун А."}
 
 # Очки
 GOAL_POINTS = 2.0
@@ -468,6 +472,70 @@ def apply_confirmed_aliases() -> list:
         players_rename(pid, new, merge_duplicate=True)
         done.append(f"«{old}» → «{new}»: статистика и pid сохранены" + (", повторная запись реестра объединена" if had_duplicate else ""))
     return done
+
+
+# Канонические данные игрока, подтверждённые Дмитрием: один человек, одно имя, один username, один pid.
+CANONICAL_PLAYERS = [
+    {"name": "Моргун А.", "old": "Alexandr", "username": "Footmor", "aliases": ["alexandr"], "stats": (1, 4, 3)},
+]
+
+
+def canonicalize_players() -> tuple:
+    """Проверяет и закрепляет канонического игрока (Моргун А. = @Footmor = прежний Alexandr, pid и статистика сохраняются).
+    Только если всё однозначно; любое реальное противоречие — ничего не меняется, возвращаются расхождения.
+    → ("ok" | "changed" | "conflict", строки)."""
+    data = load_players()
+    stats = load_stats()
+    sp = stats_players_of(stats)
+    changed_lines, problems = [], []
+    spec_changes = []
+    for spec in CANONICAL_PLAYERS:
+        name, old, uname = spec["name"], spec["old"], spec["username"]
+        row, old_row = find_key(name, data["players"]), find_key(old, data["players"])
+        if row and old_row and row != old_row:
+            problems.append(f"в списке игроков одновременно «{row}» и «{old_row}» — нельзя объединить без решения Дмитрия")
+            continue
+        row = row or old_row
+        if row is None:
+            problems.append(f"игрока «{name}» (бывший «{old}») нет в списке игроков")
+            continue
+        rec = data["players"][row]
+        skey = find_key(name, sp) or find_key(old, sp)
+        have = tuple(sp[skey].get(k, 0) for k in ("games", "goals", "assists")) if skey else None
+        if have != spec["stats"]:
+            problems.append(f"статистика «{skey or name}»: {have}, ожидалось (И, Г, П) {spec['stats']}")
+            continue
+        for other, orec in data["players"].items():
+            if other != row and uname.lower() in (x.lower() for x in orec["usernames"]):
+                problems.append(f"@{uname} уже принадлежит другому игроку «{other}»")
+        if problems:
+            continue
+        spec_changes.append((spec, row, rec, skey))
+    if problems:
+        return "conflict", problems
+    for spec, row, rec, skey in spec_changes:
+        name, uname = spec["name"], spec["username"]
+        pid = rec["pid"]
+        if row != name or skey != name:
+            players_rename(pid, name)
+            changed_lines.append(f"«{row}» → «{name}» (pid {pid} и статистика сохранены)")
+        data = load_players()
+        rec = data["players"][name]
+        touched = False
+        if uname.lower() not in (x.lower() for x in rec["usernames"]):
+            rec["usernames"].insert(0, uname)
+            touched = True
+        elif rec["usernames"][0].lower() != uname.lower():
+            rec["usernames"].sort(key=lambda x: x.lower() != uname.lower())
+            touched = True
+        for alias in spec["aliases"]:
+            if alias not in (x.lower() for x in rec["aliases"]):
+                rec["aliases"].append(alias)
+                touched = True
+        if touched:
+            save_players(data)
+            changed_lines.append(f"«{name}»: username @{uname}, алиас «{spec['old']}»")
+    return ("changed" if changed_lines else "ok"), changed_lines
 
 
 def archive_expected_totals() -> dict:
@@ -3303,11 +3371,38 @@ async def notify_archive():
         print(f"Не удалось отправить итог архива: {e}")
 
 
+async def notify_canonical():
+    """При запуске: закрепляет канонического игрока (Моргун А. = @Footmor); при противоречии ничего не меняет и пишет Дмитрию."""
+    try:
+        status, lines = canonicalize_players()
+    except DataCorrupted as e:
+        print(f"[CANON] данные недоступны: {e}")
+        return
+    except Exception as e:
+        print(f"[CANON] ошибка: {type(e).__name__}: {e}")
+        return
+    print(f"[CANON] {status}")
+    for line in lines:
+        print(f"[CANON] {line}")
+    if status == "ok":
+        return
+    if status == "changed":
+        text = "👤 Игрок закреплён: " + "; ".join(lines) + ". Статистика не менялась."
+    else:
+        text = ("⚠️ Игрок «Моргун А.» (@Footmor, бывший Alexandr) НЕ закреплён: найдено расхождение, ничего не изменено."
+                + "\n" + "\n".join(lines) + "\n\nНужно решение Дмитрия.")
+    try:
+        await bot.send_message(OWNER_ID, text)
+    except Exception as e:
+        print(f"Не удалось отправить сообщение об игроке: {e}")
+
+
 async def main():
     print(f"Постоянный запуск бота {datetime.datetime.now(YEKB_TZ)} версия {BOT_VERSION}")
     menu = await setup_menu()
     await notify_started(menu)
     await notify_archive()
+    await notify_canonical()
     scheduler = asyncio.create_task(poll_scheduler())
     try:
         await dp.start_polling(bot)
