@@ -25,7 +25,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # Будущие даты в номере не использовать. История: 2026-10-01 (меню, игроки в /data, фактический состав); 2026-10-02 (нумерация игр,
 # История игр, публикация статистики, редактирование игрока); 2026-10-03 … 2026-10-06 — версии с заранее проставленными датами
 # (архив игр №1–4, /отменить без освобождения номера); начиная с 2026-10-03.1 — по реальной дате деплоя.
-BOT_VERSION = "2026-10-18.3"
+BOT_VERSION = "2026-10-18.4"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -883,9 +883,195 @@ def heuristic_split(players: list, team_count: int, iterations: int = 3000):
 def split_teams(players: list, team_count: int):
     """players — список (имя, коэффициент). Выбирает точный или
     приближённый метод в зависимости от числа игроков."""
+    if has_color_bans(players):                  # жёсткие запреты по цвету команды (TEAM_COLOR_BANS) — отдельный перебор с отсечением
+        teams, spread, _ = pick_split(players, team_count, mode="best")
+        return teams, spread
     if len(players) <= EXACT_LIMIT:
         return exact_split(players, team_count)
     return heuristic_split(players, team_count)
+
+
+# ---- жёсткие ограничения по цвету команды и ротация составов ----------------
+
+# Игроки, которых алгоритм НИКОГДА не ставит в команду указанного цвета. Ключ — штатная нормализация имени (norm_key: регистр, ё/е, пробелы),
+# цвет — из TEAM_COLORS (команда с индексом i имеет цвет TEAM_COLORS[i]: белые, чёрные, красные). Это жёсткое отсечение вариантов, а не штраф.
+TEAM_COLOR_BANS = {norm_key("Ковалёв М."): {"красные"}}
+# Допуск «примерно такого же баланса»: разброс средних коэффициентов команд (существующая метрика max(avg) − min(avg)) не хуже лучшего найденного
+# больше, чем на эту величину. Подобран по реальному составу (тест «№7»): десятки разных вариантов при разбросе в сотые доли коэффициента.
+BALANCE_TOLERANCE = 0.15
+SPLIT_HISTORY_KEEP = 10          # сколько последних вариантов текущей игры помним, чтобы «Пересобрать» не ходило по кругу
+
+
+def team_banned(name: str, team_idx: int) -> bool:
+    colors = TEAM_COLOR_BANS.get(norm_key(name))
+    return bool(colors) and 0 <= team_idx < len(TEAM_COLORS) and TEAM_COLORS[team_idx] in colors
+
+
+def has_color_bans(players: list) -> bool:
+    return any(norm_key(p[0] if isinstance(p, (tuple, list)) else p) in TEAM_COLOR_BANS for p in players)
+
+
+def teams_fingerprint(teams) -> str:
+    """Отпечаток распределения: кто с кем играет. Порядок игроков внутри команды, номер и цвет команды не учитываются."""
+    def names(team):
+        return [x[0] if isinstance(x, (tuple, list)) else x for x in team]
+    return "|".join(sorted(",".join(sorted(norm_key(n) for n in names(t))) for t in teams))
+
+
+def _spread_of(players: list, groups) -> float:
+    avgs = [sum(players[i][1] for i in g) / len(g) for g in groups]
+    return max(avgs) - min(avgs)
+
+
+_EXACT_CACHE: dict = {}
+_UNITS_CACHE: dict = {}
+
+
+def _bans_signature():
+    return tuple(sorted((k, tuple(sorted(v))) for k, v in TEAM_COLOR_BANS.items()))
+
+
+def _exact_candidates(players: list, team_count: int, tol: float):
+    """Полный перебор разбиений (команды одинакового размера не различаются — каждое разбиение считается один раз) с жёсткими запретами:
+    разбиение допустимо, если команды можно раздать по цветам так, что запрещённые игроки не попадут в запрещённый цвет.
+    → (лучший разброс, [(разброс, группы по цветам)]) для всех допустимых вариантов в пределах tol от лучшего. Результат кэшируется."""
+    key = (tuple((n, k) for n, k in players), team_count, tol, _bans_signature())
+    if key in _EXACT_CACHE:
+        return _EXACT_CACHE[key]
+    from itertools import permutations
+    sizes = team_sizes(len(players), team_count)
+    T = len(sizes)
+    n = len(players)
+    perms = [p for p in permutations(range(T)) if all(sizes[t] == sizes[p[t]] for t in range(T))]     # группа t → цвет p[t] (тот же размер)
+    ban_slots = {i: {t for t in range(T) if team_banned(players[i][0], t)} for i in range(n) if norm_key(players[i][0]) in TEAM_COLOR_BANS}
+    best = [None]
+    cands: list = []
+
+    def valid_perms(groups):
+        if not ban_slots:
+            return perms[:1]
+        out = []
+        for p in perms:
+            if all(p[t] not in ban_slots[i] for t, g in enumerate(groups) for i in g if i in ban_slots):
+                out.append(p)
+        return out
+
+    def add(spread, groups):
+        vp = valid_perms(groups)
+        if not vp:
+            return
+        if best[0] is None or spread < best[0]:
+            best[0] = spread
+            cands[:] = [c for c in cands if c[0] <= spread + tol]
+        if spread <= best[0] + tol:
+            for p in vp:
+                ordered = [None] * T
+                for t, g in enumerate(groups):
+                    ordered[p[t]] = tuple(g)
+                cands.append((spread, ordered))
+
+    def helper(remaining, t, groups):
+        if t == T:
+            add(_spread_of(players, groups), groups)
+            return
+        for combo in combinations(remaining, sizes[t]):
+            if t and sizes[t] == sizes[t - 1] and combo[0] < groups[t - 1][0]:
+                continue                                            # равные по размеру команды — по возрастанию первого игрока (без дублей)
+            helper([i for i in remaining if i not in combo], t + 1, groups + [combo])
+
+    helper(list(range(n)), 0, [])
+    if len(_EXACT_CACHE) > 16:
+        _EXACT_CACHE.clear()
+    _EXACT_CACHE[key] = (best[0], cands)
+    return best[0], cands
+
+
+def _heuristic_candidates(players: list, team_count: int, tol: float, rng, tries: int = 200):
+    """Для больших групп: много случайных стартов + локальные обмены (запрещённые перестановки не делаются)."""
+    sizes = team_sizes(len(players), team_count)
+    n = len(players)
+    found: dict = {}
+    for _ in range(tries):
+        order = list(range(n))
+        rng.shuffle(order)
+        order.sort(key=lambda i: 0 if norm_key(players[i][0]) in TEAM_COLOR_BANS else 1)      # сначала игроки с запретами
+        groups = [[] for _ in sizes]
+        for i in order:
+            opts = [t for t in range(len(sizes)) if len(groups[t]) < sizes[t] and not team_banned(players[i][0], t)]
+            if not opts:
+                raise ValueError("Не удалось распределить игроков без нарушения жёстких правил команд.")
+            groups[rng.choice(opts)].append(i)
+        for _it in range(200):
+            cur = _spread_of(players, groups)
+            best_gain, best_swap = 1e-12, None
+            for a in range(len(groups)):
+                for b in range(a + 1, len(groups)):
+                    for ia, i in enumerate(groups[a]):
+                        for ib, j in enumerate(groups[b]):
+                            if team_banned(players[i][0], b) or team_banned(players[j][0], a):
+                                continue
+                            groups[a][ia], groups[b][ib] = j, i
+                            gain = cur - _spread_of(players, groups)
+                            groups[a][ia], groups[b][ib] = i, j
+                            if gain > best_gain:
+                                best_gain, best_swap = gain, (a, ia, b, ib)
+            if not best_swap:
+                break
+            a, ia, b, ib = best_swap
+            groups[a][ia], groups[b][ib] = groups[b][ib], groups[a][ia]
+        fp = teams_fingerprint([[players[i] for i in g] for g in groups])
+        found.setdefault(fp, (_spread_of(players, groups), [tuple(sorted(g)) for g in groups]))
+    best = min(s for s, _ in found.values())
+    return best, [(s, g) for s, g in found.values() if s <= best + tol]
+
+
+def pick_split(players: list, team_count: int, mode: str = "best", current=None, history=(), rng=None, tol: float = BALANCE_TOLERANCE):
+    """players — [(имя, коэффициент)]. Жёсткие запреты соблюдаются всегда. mode="best" — лучший по существующей метрике (детерминированно);
+    mode="rotate" — случайный из равноценных (в пределах tol от лучшего), кроме текущего состава и, по возможности, последних показанных.
+    → (команды [[(имя, коэф)]], разброс средних, статус): "ok" | "same" (равноценной альтернативы нет — вернётся прежний состав)."""
+    players = sorted(players, key=lambda p: norm_key(p[0]))      # результат не зависит от порядка ввода (и кэшируется)
+    rng = rng or (random.Random() if mode == "rotate" else random.Random(20261018))
+    if len(players) <= EXACT_LIMIT:
+        ukey = (tuple((n, k) for n, k in players), team_count, tol, _bans_signature())
+        if ukey not in _UNITS_CACHE:                            # полный перебор детерминирован — отпечатки считаем один раз
+            best, cands = _exact_candidates(players, team_count, tol)
+            if not cands:
+                raise ValueError("Не удалось распределить игроков без нарушения жёстких правил команд.")
+            built: dict = {}
+            for spread, groups in cands:
+                built.setdefault(teams_fingerprint([[players[i] for i in g] for g in groups]), (spread, []))[1].append(groups)
+            if len(_UNITS_CACHE) > 16:
+                _UNITS_CACHE.clear()
+            _UNITS_CACHE[ukey] = (best, built)
+        best, units = _UNITS_CACHE[ukey]
+    else:
+        best, cands = _heuristic_candidates(players, team_count, tol, rng)
+        if not cands:
+            raise ValueError("Не удалось распределить игроков без нарушения жёстких правил команд.")
+        units = {}
+        for spread, groups in cands:
+            units.setdefault(teams_fingerprint([[players[i] for i in g] for g in groups]), (spread, []))[1].append(groups)
+
+    def build(fp):
+        spread, versions = units[fp]
+        groups = versions[0] if mode == "best" else rng.choice(versions)
+        return [[players[i] for i in g] for g in groups], spread
+
+    if mode == "best":
+        fp = min(units, key=lambda f: (units[f][0], f))
+        teams, spread = build(fp)
+        return teams, spread, "ok"
+    cur_fp = teams_fingerprint(current) if current else None
+    pool = [f for f in units if f != cur_fp]
+    if not pool:
+        return None, best, "same"
+    hist = [h for h in history if h != cur_fp]                  # от старых к новым
+    for k in range(len(hist) + 1):                              # сначала исключаем всю историю, затем по одному «прощаем» самые старые
+        left = sorted(f for f in pool if f not in set(hist[k:]))
+        if left:
+            teams, spread = build(rng.choice(left))
+            return teams, spread, "ok"
+    return None, best, "same"
 
 
 def koef_for_names(names: list, ratings: dict, stats_players: dict):
@@ -1504,6 +1690,7 @@ def new_game(teams: list, ratings: dict | None = None, guests=()) -> dict:
         "rev": 1,
         "initial": [list(t) for t in names_teams],
         "teams": names_teams,
+        "split_history": [teams_fingerprint(names_teams)],
         "ratings": dict(ratings or {}),
         "guests": list(guests),
         "history": [],
@@ -1576,15 +1763,31 @@ def squad_replace_in_place(g: dict, out_name: str, new_name: str, rating=None, g
     _log(g, type="replace", out=outgoing, **{"in": new_name}, team=ti + 1, guest=guest, mode="place")
 
 
-def squad_rebuild(g: dict, stats_players: dict, reason: str = "rebuild"):
-    """Новый фактический список целиком проходит через алгоритм деления."""
+def squad_rebuild(g: dict, stats_players: dict, reason: str = "rebuild") -> bool:
+    """Новый фактический список целиком проходит через алгоритм деления (индивидуальные коэффициенты прежние, пересчитываются только составы).
+    Ручная пересборка (reason="manual") выдаёт ДРУГОЙ равноценный вариант: текущий и последние показанные исключаются. Если равноценной
+    альтернативы нет — состав не меняется и возвращается False (бот честно сообщает об этом). Добавление/замена игрока — лучший вариант."""
     names = game_players(g)
     if len(names) < 2:
         raise ValueError("Для деления нужно минимум два игрока.")
     koefs, _, _ = koef_for_names(names, g["ratings"], stats_players)
-    teams, _ = split_teams([(n, koefs[n]) for n in names], team_count_for(len(names)))
+    players = [(n, koefs[n]) for n in names]
+    if reason == "manual":
+        cur_fp = teams_fingerprint(g["teams"])
+        history = [h for h in g.get("split_history", []) if isinstance(h, str)]
+        if cur_fp not in history:
+            history.append(cur_fp)
+        teams, _, status = pick_split(players, team_count_for(len(names)), mode="rotate", current=g["teams"], history=history)
+        g["split_history"] = history[-SPLIT_HISTORY_KEEP:]
+        if status != "ok":
+            return False
+        g["split_history"] = (history + [teams_fingerprint(teams)])[-SPLIT_HISTORY_KEEP:]
+    else:
+        teams, _ = split_teams(players, team_count_for(len(names)))
+        g["split_history"] = [teams_fingerprint(teams)]
     g["teams"] = [[n for n, _ in team] for team in teams]
     _log(g, type="rebuild", reason=reason)
+    return True
 
 
 def squad_replace_rebuild(g: dict, out_name: str, new_name: str, stats_players: dict, rating=None, guest=False):
@@ -1737,6 +1940,8 @@ HELP_SECTIONS = {
         "⚙️ Изменить состав (/состав) — работает с фактическим составом, в том числе после публикации: "
         "➕ добавить (игрока или гостя), ➖ убрать, 🔄 заменить. Замена: «📌 Поставить на его место» "
         "(та же команда, остальные не меняются) или «🔄 Пересобрать команды» (заново по коэффициентам). "
+        "«Пересобрать команды» (🔁) каждый раз выдаёт ДРУГОЙ, примерно так же сбалансированный вариант: текущий состав и несколько последних показанных не повторяются; "
+        "если равноценной альтернативы нет, бот так и скажет и оставит состав. Ковалёв М. по жёсткому правилу никогда не попадает в красных. "
         "Первоначальный состав сохраняется, история изменений доступна. После правок появится кнопка "
         "«📢 Опубликовать обновлённый состав».\n\n"
         "Ручной вариант для всех: /составы Иванов, Петров, ... — разбить список (в фактический состав "
@@ -2833,9 +3038,10 @@ async def cb_squad(query: types.CallbackQuery):
                        "(первоначальный состав и история сохранятся).",
                        kb([[btn("✅ Да, пересобрать", f"sq:rb:{g['rev']}"), btn("❌ Отмена", "sq:menu")]]))
         elif action == "rb":
-            squad_rebuild(g, sp, reason="manual")
+            changed = squad_rebuild(g, sp, reason="manual")
             save_game(g)
-            await show_squad(query, "🔁 Команды пересобраны.")
+            await show_squad(query, "🔁 Команды пересобраны." if changed else
+                             "ℹ️ Другого достаточно ровного варианта при текущем составе не найдено — составы остались прежними.")
     except (ValueError, KeyError, IndexError) as e:
         await query.message.answer(f"⚠️ {e}")
     await ack(query)
