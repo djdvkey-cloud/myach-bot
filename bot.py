@@ -25,7 +25,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # Будущие даты в номере не использовать. История: 2026-10-01 (меню, игроки в /data, фактический состав); 2026-10-02 (нумерация игр,
 # История игр, публикация статистики, редактирование игрока); 2026-10-03 … 2026-10-06 — версии с заранее проставленными датами
 # (архив игр №1–4, /отменить без освобождения номера); начиная с 2026-10-03.1 — по реальной дате деплоя.
-BOT_VERSION = "2026-10-18.6"
+BOT_VERSION = "2026-10-18.7"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -344,8 +344,14 @@ def fmt_num(v: float) -> str:
 
 
 def norm_key(s: str) -> str:
-    """Ключ сравнения имён: без регистра, ё = е, лишние пробелы убраны."""
-    return re.sub(r"\s+", " ", s.strip().replace("ё", "е").replace("Ё", "Е")).casefold()
+    """ЕДИНЫЙ ключ сопоставления имён (player_match_key) для всего бота: статистика, реестр, составы, массовый ввод, правило цвета, запись игр.
+    Эквивалентны: регистр, ё/е, лишние пробелы и точка после инициала («Мякушко З.» = «Мякушко З» = «мякушко з» = «МЯКУШКО З.»,
+    «Ковалёв М.» = «ковалев м»). Дефисы, апострофы и остальные части фамилии сохраняются. Ключ нужен ТОЛЬКО для поиска/сравнения —
+    отображаемое каноническое имя (как записано в статистике/реестре) не меняется."""
+    return re.sub(r"\s+", " ", re.sub(r"\.+", " ", s.strip().replace("ё", "е").replace("Ё", "Е"))).strip().casefold()
+
+
+player_match_key = norm_key
 
 
 def find_key(name: str, candidates) -> str | None:
@@ -2728,7 +2734,7 @@ async def do_split(reply):
             f"Сначала нужно привязать: {names}\nНажмите на имя — выберите игрока или создайте нового.",
             reply_markup=kb(rows),
         )
-    guests = load_json(GUESTS_FILE, [])
+    guests = [dict(g, name=resolve_name(g["name"], stats_players_of(stats), pdata["players"])) for g in load_json(GUESTS_FILE, [])]
     ratings = {g["name"]: g.get("rating") for g in guests}
     names, seen = [], set()
     for n in [v["player"] for v in voters.values()] + [g["name"] for g in guests]:
@@ -2810,12 +2816,13 @@ async def cmd_add_guest(message: types.Message, command: CommandObject):
         return
     if not command.args:
         return await message.answer("Формат: /добавить Алексей, Максим 2.3")
+    try:
+        entries = split_guest_entries(command.args)
+    except ValueError as e:
+        return await message.answer(f"⚠️ {e}")
     guests = load_json(GUESTS_FILE, [])
-    for part in command.args.split(","):
-        part = part.strip()
-        m = re.match(r"^(.+?)(?:\s+(\d+(?:[.,]\d+)?))?$", part)
-        if m:
-            guests.append({"name": m.group(1).strip(), "rating": float(m.group(2).replace(",", ".")) if m.group(2) else None})
+    for name, rating in entries:
+        guests.append({"name": name, "rating": rating})
     save_json(GUESTS_FILE, guests)
     await message.answer("Добавлены: " + ", ".join(g["name"] for g in guests))
 
@@ -2963,12 +2970,17 @@ def add_menu(g: dict, names: list, page: int, header: str):
 
 def split_guest_entries(text: str) -> list:
     """«Иван, Пётр от Вадима 2.3, Сергей» → [(имя, рейтинг|None)]; разделители — запятая, точка с запятой, перенос строки."""
+    text = re.sub(r"(?<=\d),(?=\d)", ".", text)           # «Борис 1,5» — десятичная запятая рейтинга, а не разделитель списка
     parts = [p for p in re.split(r"[,;\n]+", text) if p.strip()]
     if not parts:
         raise ValueError("Не понял имя. Формат: Имя или несколько имён через запятую (рейтинг необязателен: Имя 2.3).")
     if len(parts) > GUEST_BATCH_MAX:
         raise ValueError(f"Слишком много имён за раз (максимум {GUEST_BATCH_MAX}).")
-    return [parse_guest_text(p) for p in parts]
+    entries = [parse_guest_text(p) for p in parts]
+    for name, _rating in entries:
+        if not re.search(r"[^\W\d_]", name):
+            raise ValueError(f"«{name}» не похоже на имя. Имена — через запятую; рейтинг пишите с точкой: Имя 2.5.")
+    return entries
 
 
 def squad_add_batch(g: dict, entries: list, pdata: dict, sp: dict):
@@ -3019,12 +3031,19 @@ async def after_choose_incoming(target_answer_or_edit, g: dict, sp: dict):
     await target_answer_or_edit(text, kb(rows))
 
 
+GUEST_RATING_RE = re.compile(r"^(.*\S)\s+(\d+[.,]\d+)$")
+
+
 def parse_guest_text(text: str):
-    m = re.match(r"^(.+?)(?:\s+(\d+(?:[.,]\d+)?))?$", text.strip())
-    if not m or not m.group(1).strip():
-        raise ValueError("Не понял имя. Формат: Имя или Имя 2.3 (рейтинг необязателен).")
-    rating = float(m.group(2).replace(",", ".")) if m.group(2) else None
-    return re.sub(r"\s+", " ", m.group(1).strip()), rating
+    """«Алексей 2.3» → («Алексей», 2.3); «Игрок 03», «Игрок 3», «Алексей» → имя целиком, рейтинга нет. Рейтингом считается только число с дробной
+    частью (через точку или запятую) после имени — целый суффикс может быть частью имени и молча не отрезается."""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        raise ValueError("Не понял имя. Формат: Имя или несколько имён через запятую (рейтинг необязателен: Имя 2.3).")
+    m = GUEST_RATING_RE.match(t)
+    if m:
+        return m.group(1).strip(), float(m.group(2).replace(",", "."))
+    return t, None
 
 
 async def handle_squad_guest_text(message, st, text):
@@ -3053,7 +3072,7 @@ async def handle_squad_guest_text(message, st, text):
     canon = resolve_name(name, sp, pdata["players"])
     if _find_in_squad(g, canon):
         raise ValueError(f"«{canon}» уже в составе.")
-    guest = not find_key(canon, pdata["players"])
+    guest = not (find_key(canon, pdata["players"]) or find_key(canon, sp))       # известный по статистике или реестру — не гость
     g["pending"].update({"in": canon, "rating": rating, "guest": guest})
     save_game(g)
     await after_choose_incoming(lambda t, m: message.answer(t, reply_markup=m), g, sp)
@@ -3128,11 +3147,11 @@ async def cb_squad(query: types.CallbackQuery):
                 raise ValueError("Начните действие заново.")
             AWAITING[OWNER_ID] = {"kind": "squad_guest", "gid": g["id"], "rev": g["rev"]}
             if (g.get("pending") or {}).get("op") == "replace":
-                hint = ("Отправьте имя игрока, при желании с рейтингом: Алексей или Алексей 2.3\n"
+                hint = ("Отправьте имя игрока, при желании с рейтингом (с дробной частью): Алексей или Алексей 2.3\n"
                         "Без рейтинга и статистики будет использован средний коэффициент игроков. Отмена — /отмена.")
             else:
                 hint = ("Введите одно или несколько имён через запятую.\nНапример:\nИван, Пётр от Вадима, Сергей\n\n"
-                        "Рейтинг необязателен (Имя 2.3). Известные игроки из статистики распознаются автоматически, дублей не будет. Отмена — /отмена.")
+                        "Рейтинг необязателен и пишется с дробной частью: Имя 2.3 (число без дроби — часть имени). Известные игроки из статистики распознаются автоматически (регистр, ё/е, точка после инициала не важны), дублей не будет. Отмена — /отмена.")
             await edit(hint, kb([[btn("⬅️ Назад", "sq:menu")]]))
         elif action == "at":
             p = g.get("pending") or {}
