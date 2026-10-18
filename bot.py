@@ -25,7 +25,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # Будущие даты в номере не использовать. История: 2026-10-01 (меню, игроки в /data, фактический состав); 2026-10-02 (нумерация игр,
 # История игр, публикация статистики, редактирование игрока); 2026-10-03 … 2026-10-06 — версии с заранее проставленными датами
 # (архив игр №1–4, /отменить без освобождения номера); начиная с 2026-10-03.1 — по реальной дате деплоя.
-BOT_VERSION = "2026-10-03.3"
+BOT_VERSION = "2026-10-18.3"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -176,6 +176,10 @@ def atomic_write_text(path: str, text: str):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o644)   # mkstemp даёт 0600 — такие файлы кабинет Amvera не может выгрузить (проверено тестом)
+        except OSError:
+            pass
     except BaseException:
         try:
             os.unlink(tmp)
@@ -1756,6 +1760,13 @@ HELP_SECTIONS = {
         "при записи бот спрашивает — «✏️ Исправление» (та же Игра №N, прежние номер и дата) или «🆕 Новый вечер» (следующий номер); "
         "для /матч — слова «исправление N» или «новый» (/матч исправление 5 Иванов 2+1; /матч новый Иванов 2+1). "
         "Новый вечер получает следующий номер, номер отменённой игры никому не достаётся.\n\n"
+        "🕘 ПРОШЛАЯ ИГРА. Если вечер не записали, а следующая игра уже создана: «🕘 Записать прошлую игру» (или /прошлая). "
+        "А) Состав сохранился в архиве — выберите вечер (по одному на вечер, последний состав; пересборки текущей игры не показываются), "
+        "внесите голы/передачи кнопками ➖/➕, проверьте «Игра №N · дата · команды · суммы» и нажмите «Записать». "
+        "Б) Состава в архиве нет (бот не работал) — «✍️ Ввести вручную»: одним сообщением /прошлаяигра ДД.ММ.ГГГГ, далее строки «Белые: Рим 4+2, Ковалёв М. 3+1», "
+        "«Чёрные: …», «Красные: …» (цвета задают порядок команд). Имена сверяются с реестром и статистикой, новые бот отмечает. "
+        "Дату поправляет /датаигры ДД.ММ.ГГГГ. На одну дату записывается одна игра, повтор блокируется; текущий состав не подставляется, "
+        "текущая игра, её опрос и расписание не меняются.\n\n"
         "Ограничения: результат одного состава записывается один раз — повтор блокируется; если состав "
         "изменился, ввод идёт уже по новому. Гость после записи попадает в статистику под своим именем; "
         "регистр и «ё/е» не создают дублей."
@@ -1930,6 +1941,7 @@ def main_panel() -> types.InlineKeyboardMarkup:
         [btn("⚖️ Составы (разделить)", "m:split"), btn("⚙️ Изменить состав", "m:squad")],
         [btn("⚽ Внести результат матча", "m:result"), btn("💰 Рассчитать оплату", "m:pay")],
         [btn("📊 Статистика", "m:stats"), btn("📚 История игр", "m:history")],
+        [btn("🕘 Записать прошлую игру", "m:past")],
         [btn("❓ Help", "m:help")],
     ])
 
@@ -2047,6 +2059,8 @@ async def cb_panel(query: types.CallbackQuery):
         await send_stats(query.message.answer, owner=True)
     elif action == "history":
         await show_history_list(query, 0)
+    elif action == "past":
+        await show_past_list(query)
     elif action == "poll":
         today = datetime.datetime.now(YEKB_TZ).date()
         monday = poll_target_monday(today)
@@ -2979,6 +2993,382 @@ async def cb_result(query: types.CallbackQuery):
 
 
 # ============================================================
+# Записать прошлую игру. Два сценария:
+#  А) состав сохранён в архиве (game_archive.json) — выбирается незаписанный вечер;
+#  Б) состава в архиве нет (бот не работал при формировании) — администратор вводит дату, команды и голы/передачи вручную.
+# Текущая игра (game.json), её опрос и расписание НЕ используются как замена состава и НЕ меняются.
+# ============================================================
+PAST_DRAFT_FILE = os.path.join(DATA_DIR, "past_game_draft.json")
+PAST_MAX_PLAYERS = 30
+PAST_COLOR_ORDER = {"белые": 0, "белая": 0, "черные": 1, "черная": 1, "красные": 2, "красная": 2}   # ключи без «ё»; индекс = цвет в TEAM_COLORS (белые, чёрные, красные)
+
+
+def _past_default_date(g: dict) -> str:
+    """Дата футбольного вечера (игры по понедельникам): ближайший понедельник не раньше создания состава (до 06:00 — предыдущий день).
+    Дмитрий видит дату перед записью и может изменить её командой /датаигры."""
+    try:
+        dt = datetime.datetime.fromisoformat(g.get("created") or "")
+        dt = dt.replace(tzinfo=YEKB_TZ) if dt.tzinfo is None else dt.astimezone(YEKB_TZ)
+    except ValueError:
+        return game_date_now()
+    if dt.hour < 6:
+        dt -= datetime.timedelta(days=1)
+    day = dt.date()
+    return (day + datetime.timedelta(days=(7 - day.weekday()) % 7)).isoformat()
+
+
+def _past_names(teams) -> set:
+    return {norm_key(n) for team in teams for n in team}
+
+
+def _past_duplicate(games: dict, date: str, teams) -> dict | None:
+    """Игра, уже записанная на эту дату (на один вечер — одна игра)."""
+    return next((g for g in games["games"] if g.get("date") == date), None)
+
+
+def past_candidates() -> list:
+    """Сценарий А. Незаписанные прошлые игры, новые первыми: по одной на вечер (последний сформированный состав). Состав берётся только
+    из архива. Не предлагаются: вечер текущей игры (пересборки её состава), вечера не позже последней записанной игры, уже записанные."""
+    archive = load_json(GAME_ARCHIVE_FILE, [])
+    if not isinstance(archive, list):
+        return []
+    cur = load_game()
+    cur_day = _past_default_date(cur) if cur and cur.get("created") else None
+    games = load_games()
+    last_date = max((g.get("date", "") for g in games["games"]), default="")
+    by_day = {}
+    for g in archive:
+        if (not isinstance(g, dict) or g.get("result_recorded") or g.get("game_number") or not g.get("id")
+                or not isinstance(g.get("teams"), list) or not any(g["teams"])):
+            continue
+        if cur and cur.get("id") == g["id"]:
+            continue
+        day = _past_default_date(g)
+        if day <= last_date or day == cur_day or _past_duplicate(games, day, g["teams"]):
+            continue
+        if day not in by_day or (g.get("created") or "") > (by_day[day].get("created") or ""):
+            by_day[day] = g
+    return sorted(by_day.values(), key=lambda x: _past_default_date(x), reverse=True)
+
+
+def past_draft_load() -> dict | None:
+    d = load_json(PAST_DRAFT_FILE, None)
+    return d if isinstance(d, dict) and d.get("src_id") and isinstance(d.get("teams"), list) and isinstance(d.get("result"), dict) else None
+
+
+def past_draft_start(src: dict) -> dict:
+    d = past_draft_load()
+    if d and d["src_id"] == src["id"]:
+        return d
+    d = {"src_id": src["id"], "created": src.get("created"), "date": _past_default_date(src),
+         "teams": [list(t) for t in src["teams"]]}
+    result_init(d)
+    save_json(PAST_DRAFT_FILE, d)
+    return d
+
+
+def past_draft_clear():
+    try:
+        os.unlink(PAST_DRAFT_FILE)
+    except OSError:
+        pass
+
+
+PAST_MANUAL_HELP = (
+    "✍️ Ввод прошлой игры вручную (состава в архиве нет)\n\n"
+    "Отправьте ОДНИМ сообщением: первая строка — команда и дата, далее по строке на команду:\n\n"
+    "/прошлаяигра 12.10.2026\n"
+    "Белые: Рим 4+2, Ковалёв М. 3+1, Калабин Д. 0+2\n"
+    "Чёрные: Азиз 1+1, Фаррух 2+2\n"
+    "Красные: Сикач И. 5+4, Мякушко З. 1+2\n\n"
+    "Игрок: «Имя голы+передачи», без цифр — 0+0. Команд минимум две. Названия «Белые/Чёрные/Красные» задают цвет команды; "
+    "имена приводятся к записям из статистики и реестра, незнакомые бот отметит как «новый игрок». Дальше — полный предпросмотр, "
+    "статистика меняется только после «Записать». Текущий состав и опрос не используются и не меняются."
+)
+
+
+def parse_manual_past(text: str):
+    """«ДД.ММ.ГГГГ» + строки «Метка: Имя 2+1, Имя …». → (дата ISO, команды [[(имя, голы, передачи)]], ошибки).
+    Имена — в каноническом написании; если у всех команд метки-цвета (Белые/Чёрные/Красные), порядок команд = порядок цветов бота."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    errors, teams, labels = [], [], []
+    if not lines:
+        return None, [], ["Нет данных. Формат — в подсказке «Ввести вручную»."]
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$", lines[0])
+    try:
+        day = datetime.date(int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else None
+    except ValueError:
+        day = None
+    if day is None:
+        errors.append("Первая строка после команды — дата ДД.ММ.ГГГГ (реальная).")
+    elif day > datetime.datetime.now(YEKB_TZ).date():
+        errors.append("Дата в будущем — прошлую игру так записать нельзя.")
+    for ln in lines[1:]:
+        label, sep, rest = ln.partition(":")
+        if not sep or not rest.strip():
+            errors.append(f"Строка «{ln[:40]}»: ожидалось «Команда: Имя 2+1, Имя …».")
+            continue
+        players, errs = parse_match_line(rest)
+        errors += [f"{label.strip()}: не разобрал «{e}» (нужно «Имя 2+1»)" for e in errs]
+        if not players:
+            errors.append(f"{label.strip()}: нет игроков.")
+        teams.append(players)
+        labels.append(label.strip().casefold().replace("ё", "е"))
+    if len(teams) < 2:
+        errors.append("Нужно минимум две команды.")
+    if errors:
+        return None, [], errors
+    keys = [PAST_COLOR_ORDER.get(lb) for lb in labels]
+    if all(k is not None for k in keys) and len(set(keys)) == len(keys):
+        teams = [t for _k, t in sorted(zip(keys, teams), key=lambda x: x[0])]
+    registered = set(load_players()["players"])
+    sp = stats_players_of(load_stats())
+    out, seen = [], {}
+    for ti, team in enumerate(teams):
+        row = []
+        for name, gl, a in team:
+            cname = resolve_name(name, sp, registered)
+            k = norm_key(cname)
+            if k in seen:
+                errors.append(f"«{cname}» указан дважды (команды {seen[k] + 1} и {ti + 1}).")
+            seen[k] = ti
+            row.append((cname, min(gl, 99), min(a, 99)))
+        out.append(row)
+    if sum(len(t) for t in out) > PAST_MAX_PLAYERS:
+        errors.append(f"Слишком много игроков (больше {PAST_MAX_PLAYERS}).")
+    return (None, [], errors) if errors else (day.isoformat(), out, [])
+
+
+def past_draft_manual(day: str, teams: list) -> dict:
+    d = {"src_id": "manual-" + datetime.datetime.now(YEKB_TZ).strftime("%Y%m%d%H%M%S"), "manual": True, "date": day,
+         "teams": [[n for n, _g, _a in t] for t in teams]}
+    result_init(d)
+    for t in teams:
+        for n, gl, a in t:
+            d["result"]["g"][n], d["result"]["a"][n] = gl, a
+    save_json(PAST_DRAFT_FILE, d)
+    return d
+
+
+def past_list_view():
+    cands = past_candidates()
+    manual = [btn("✍️ Ввести вручную (состава нет)", "pg:man")]
+    if not cands:
+        return ("🕘 Записать прошлую игру\n\nСоставов незаписанных прошлых игр в архиве не найдено. Бот НЕ подставляет сюда текущий состав. "
+                "Если вечер прошёл без сохранённого состава — нажмите «Ввести вручную».", kb([manual, [btn("⬅️ Меню", "m:home")]]))
+    lines = ["🕘 Записать прошлую игру", "", "Выберите игру из архива. Состав берётся именно этой игры; текущая игра и опрос не меняются.", ""]
+    rows = []
+    for g in cands:
+        n = sum(len(t) for t in g["teams"])
+        try:
+            made = datetime.datetime.fromisoformat(g["created"]).astimezone(YEKB_TZ).strftime("%H:%M")
+        except (KeyError, ValueError, TypeError):
+            made = "?"
+        title = f"{fmt_game_date(_past_default_date(g))} · {n} игроков · состав создан {made}"
+        lines.append("• " + title)
+        rows.append([btn(title, f"pg:s:{g['id']}")])
+    rows += [manual, [btn("⬅️ Меню", "m:home")]]
+    return "\n".join(lines), kb(rows)
+
+
+def past_head(d: dict) -> str:
+    return (f"🕘 Прошлая игра от {fmt_game_date(d['date'])} (в журнале: Игра №{next_game_number(load_games())})\n"
+            "Дата неверна? Команда /датаигры ДД.ММ.ГГГГ")
+
+
+def past_draft_text(d: dict) -> str:
+    return (past_head(d) + "\n\nНажмите на игрока, чтобы указать ⚽ голы и 🎯 передачи. У остальных будет 0+0.\n"
+            f"Состав этой игры: {len(d['result']['roster'])} игроков.")
+
+
+def past_draft_markup(d: dict) -> types.InlineKeyboardMarkup:
+    res = d["result"]
+    buttons = []
+    for i, n in enumerate(res["roster"]):
+        gl, a = res["g"].get(n, 0), res["a"].get(n, 0)
+        buttons.append(btn(f"{n}{f' {gl}+{a}' if gl or a else ''}", f"pg:p:{i}"))
+    rows = chunk_rows(buttons, 2)
+    rows.append([btn("➡️ Далее (проверить)", "pg:prev")])
+    rows.append([btn("⬅️ К списку игр", "pg:l"), btn("❌ Отмена", "pg:cancel")])
+    return kb(rows)
+
+
+def past_player_screen(d: dict, idx: int):
+    res = d["result"]
+    n = res["roster"][idx]
+    gl, a = res["g"].get(n, 0), res["a"].get(n, 0)
+    return (f"{n}\n\n⚽ Голы: {gl}\n🎯 Передачи: {a}", kb([
+        [btn("➖ гол", f"pg:g-:{idx}"), btn(f"⚽ {gl}", "noop"), btn("➕ гол", f"pg:g+:{idx}")],
+        [btn("➖ пас", f"pg:a-:{idx}"), btn(f"🎯 {a}", "noop"), btn("➕ пас", f"pg:a+:{idx}")],
+        [btn("⬅️ К списку", "pg:menu")],
+    ]))
+
+
+def past_preview(d: dict):
+    res = d["result"]
+    games = load_games()
+    lines = ["🔎 Проверьте перед записью", "", f"Игра №{next_game_number(games)} · {fmt_game_date(d['date'])} · Лестех", ""]
+    tg = ta = 0
+    for ti, team in enumerate(d["teams"]):
+        sg = sum(res["g"].get(n, 0) for n in team)
+        sa = sum(res["a"].get(n, 0) for n in team)
+        tg, ta = tg + sg, ta + sa
+        lines.append(f"{TEAM_ICONS[ti % len(TEAM_ICONS)]} Команда {ti + 1} ({TEAM_COLORS[ti % len(TEAM_COLORS)]}) — ⚽ {sg} · 🎯 {sa}")
+        for n in team:
+            lines.append(f"{n} — ⚽ {res['g'].get(n, 0)} · 🎯 {res['a'].get(n, 0)}")
+        lines.append("")
+    lines.append(f"Итого: игроков {len(res['roster'])}, голов {tg}, передач {ta}.")
+    sp = stats_players_of(load_stats())
+    registered = set(load_players()["players"])
+    new = [n for n in res["roster"] if not find_key(n, sp) and not find_key(n, registered)]
+    if new:
+        lines.append("🆕 Новые игроки (проверьте написание): " + ", ".join(new))
+    lines += ["", "Статистика изменится только после «Записать»."]
+    taken = _past_duplicate(games, d["date"], d["teams"])
+    if taken:
+        lines += ["", f"⛔ На эту дату уже записана {game_title(taken)}. Повторно записать нельзя — поправьте дату (/датаигры)."]
+    elif any(g.get("date", "") > d["date"] for g in games["games"]):
+        lines += ["", "⚠️ В журнале уже есть игра с более поздней датой: номер всё равно будет следующим по порядку."]
+    markup = kb(([] if taken else [[btn(f"✅ Записать как Игра №{next_game_number(games)} от {fmt_game_date(d['date'])}", f"pg:ok:{d['src_id']}")]])
+                + [[btn("✏️ Изменить", "pg:menu"), btn("❌ Отмена", "pg:cancel")]])
+    return "\n".join(lines), markup
+
+
+async def show_past_list(query):
+    try:
+        text, markup = past_list_view()
+    except DataCorrupted as e:
+        return await report_data_error(e, query=query)
+    await edit_or_send(query, text, markup)
+
+
+@dp.message(Command("прошлая", "past"))
+async def cmd_past(message: types.Message):
+    if not is_owner_private(message):
+        return
+    try:
+        text, markup = past_list_view()
+    except DataCorrupted as e:
+        return await report_data_error(e, message=message)
+    await message.answer(text, reply_markup=markup)
+
+
+@dp.message(Command("прошлаяигра", "pastgame"))
+async def cmd_past_manual(message: types.Message, command: CommandObject):
+    """Сценарий Б: ручной ввод прошлой игры без архивного состава."""
+    if not is_owner_private(message):
+        return
+    if not (command.args or "").strip():
+        return await message.answer(PAST_MANUAL_HELP)
+    try:
+        day, teams, errors = parse_manual_past(command.args)
+        if errors:
+            return await message.answer("⚠️ Не записываю — исправьте и отправьте снова:\n• " + "\n• ".join(errors) + "\n\nФормат: /прошлаяигра")
+        taken = _past_duplicate(load_games(), day, [[n for n, _g, _a in t] for t in teams])
+        if taken:
+            return await message.answer(f"⛔ На {fmt_game_date(day)} уже записана {game_title(taken)}. Повторно записать нельзя.")
+        d = past_draft_manual(day, teams)
+        text, markup = past_preview(d)
+    except DataCorrupted as e:
+        return await report_data_error(e, message=message)
+    await message.answer(text, reply_markup=markup)
+
+
+@dp.message(Command("датаигры", "gamedate"))
+async def cmd_past_date(message: types.Message, command: CommandObject):
+    if not is_owner_private(message):
+        return
+    d = past_draft_load()
+    if not d:
+        return await message.answer("Сначала откройте прошлую игру: /прошлая.")
+    m = re.match(r"^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s*$", command.args or "")
+    try:
+        day = datetime.date(int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else None
+    except ValueError:
+        day = None
+    if day is None or day > datetime.datetime.now(YEKB_TZ).date():
+        return await message.answer("Формат: /датаигры ДД.ММ.ГГГГ (реальная дата, не позже сегодняшней).")
+    d["date"] = day.isoformat()
+    save_json(PAST_DRAFT_FILE, d)
+    await message.answer(past_draft_text(d), reply_markup=past_draft_markup(d))
+
+
+@dp.callback_query(F.data.startswith("pg:"))
+async def cb_past(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    parts = query.data.split(":")
+    action = parts[1]
+    try:
+        if action == "l":
+            await show_past_list(query)
+        elif action == "man":
+            await edit_or_send(query, PAST_MANUAL_HELP, kb([[btn("⬅️ К списку игр", "pg:l"), btn("⬅️ Меню", "m:home")]]))
+        elif action == "s":
+            src = next((g for g in past_candidates() if g["id"] == parts[2]), None)
+            if src is None:
+                await query.answer("Игра не найдена среди незаписанных.", show_alert=True)
+                return await show_past_list(query)
+            d = past_draft_start(src)
+            await edit_or_send(query, past_draft_text(d), past_draft_markup(d))
+        else:
+            d = past_draft_load()
+            if not d:
+                return await query.answer("Ввод устарел. Откройте заново: /прошлая.", show_alert=True)
+            if action == "menu":
+                await edit_or_send(query, past_draft_text(d), past_draft_markup(d))
+            elif action == "p":
+                text, markup = past_player_screen(d, int(parts[2]))
+                await edit_or_send(query, text, markup)
+            elif action in ("g+", "g-", "a+", "a-"):
+                result_adjust(d, int(parts[2]), "g" if action[0] == "g" else "a", 1 if action[1] == "+" else -1)
+                save_json(PAST_DRAFT_FILE, d)
+                text, markup = past_player_screen(d, int(parts[2]))
+                await edit_or_send(query, text, markup)
+            elif action == "prev":
+                text, markup = past_preview(d)
+                await edit_or_send(query, text, markup)
+            elif action == "cancel":
+                past_draft_clear()
+                await edit_or_send(query, "Ввод прошлой игры отменён, статистика не менялась.", kb([[btn("⬅️ Меню", "m:home")]]))
+            elif action == "ok":
+                async with RECORD_LOCK:
+                    d = past_draft_load()
+                    if not d or d["src_id"] != parts[2]:
+                        return await query.answer("Ввод устарел. Откройте заново: /прошлая.", show_alert=True)
+                    archive, src = None, None
+                    if not d.get("manual"):                                   # сценарий А: пометка в архиве обязательна
+                        archive = load_json(GAME_ARCHIVE_FILE, [])
+                        src = next((g for g in archive if isinstance(g, dict) and g.get("id") == d["src_id"]), None) if isinstance(archive, list) else None
+                        if src is None:
+                            return await query.answer("Состав этой игры в архиве не найден — запись остановлена.", show_alert=True)
+                        if src.get("result_recorded") or src.get("game_number"):
+                            past_draft_clear()
+                            return await query.answer(f"Эта игра уже записана (Игра №{src.get('game_number')}).", show_alert=True)
+                    games = load_games()
+                    taken = _past_duplicate(games, d["date"], d["teams"])
+                    if taken:
+                        return await query.answer(f"На эту дату уже записана {game_title(taken)}.", show_alert=True)
+                    entries = result_entries(d)
+                    written, game = record_match_full(entries, teams=d["teams"], date=d["date"], mode="new")
+                    if src is not None:
+                        src["result_recorded"], src["game_number"] = True, game["number"]
+                        src["recorded_at"], src["recorded"] = now_iso(), [list(w) for w in written]
+                        save_json(GAME_ARCHIVE_FILE, archive)
+                    past_draft_clear()
+                scorers = [f"{n} {gl}+{a}" for n, gl, a in written if gl or a]
+                await edit_or_send(
+                    query, f"✅ Прошлая игра записана ({len(written)} игроков) — {game_title(game)}.\n"
+                    + ("Результативные: " + ", ".join(scorers) if scorers else "Голов и передач нет.")
+                    + "\nТекущая игра и опрос не менялись.", kb([[btn("📚 История игр", "m:history"), btn("⬅️ Меню", "m:home")]]))
+    except DataCorrupted as e:
+        return await report_data_error(e, query=query)
+    except (ValueError, IndexError, KeyError) as e:
+        await query.message.answer(f"⚠️ {e}")
+    await ack(query)
+
+
+# ============================================================
 # Оплата
 # ============================================================
 
@@ -3391,6 +3781,7 @@ OWNER_MENU_COMMANDS = [
     ("pay", "Рассчитать оплату"),
     ("stats", "Показать статистику"),
     ("history", "История игр"),
+    ("past", "Записать прошлую игру"),
     ("players", "Игроки и привязки"),
     ("help", "Help — инструкция администратора"),
 ]
@@ -3552,8 +3943,24 @@ async def notify_canonical():
         print(f"Не удалось отправить сообщение об игроке: {e}")
 
 
+
+
+def normalize_data_permissions():
+    """Один раз при старте: делает файлы в DATA_DIR читаемыми для выгрузки Data из кабинета Amvera (файлы, записанные
+    через mkstemp до исправления, имеют права 0600 и не скачиваются). Содержимое файлов не меняется."""
+    try:
+        for root, _dirs, files in os.walk(DATA_DIR):
+            for name in files:
+                try:
+                    os.chmod(os.path.join(root, name), 0o644)
+                except OSError:
+                    pass
+    except Exception as e:
+        print(f"[DEBUG] normalize_data_permissions: {type(e).__name__}: {e}", flush=True)
+
 async def main():
     print(f"Постоянный запуск бота {datetime.datetime.now(YEKB_TZ)} версия {BOT_VERSION}")
+    normalize_data_permissions()
     menu = await setup_menu()
     await notify_started(menu)
     await notify_archive()
