@@ -25,7 +25,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # Будущие даты в номере не использовать. История: 2026-10-01 (меню, игроки в /data, фактический состав); 2026-10-02 (нумерация игр,
 # История игр, публикация статистики, редактирование игрока); 2026-10-03 … 2026-10-06 — версии с заранее проставленными датами
 # (архив игр №1–4, /отменить без освобождения номера); начиная с 2026-10-03.1 — по реальной дате деплоя.
-BOT_VERSION = "2026-10-18.5"
+BOT_VERSION = "2026-10-18.6"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -1967,6 +1967,7 @@ HELP_SECTIONS = {
         "⚙️ Изменить состав (/состав) — работает с фактическим составом, в том числе после публикации: "
         "➕ добавить (игрока или гостя), ➖ убрать, 🔄 заменить. Замена: «📌 Поставить на его место» "
         "(та же команда, остальные не меняются) или «🔄 Пересобрать команды» (заново по коэффициентам). "
+        "«Добавить игрока» предлагает кнопками ВСЕХ игроков из статистики, сыгравших хотя бы одну игру (даже если их нет в чате), с листанием; «Добавить нового гостя» принимает один или несколько новых людей через запятую одним сообщением (известные по статистике распознаются и не дублируются), после чего доступна «Пересобрать команды». "
         "«Пересобрать команды» (🔁) каждый раз выдаёт ДРУГОЙ, примерно так же сбалансированный вариант: текущий состав и несколько последних показанных не повторяются; "
         "если равноценной альтернативы нет, бот так и скажет и оставит состав. Ковалёв М. по жёсткому правилу никогда не попадает в красных — ни при делении и пересборке, ни при ручном «добавить в команду», «на его место» или замене (такое действие не выполняется, бот пишет «Ковалёв М. не может играть в Красной команде»). "
         "Первоначальный состав сохраняется, история изменений доступна. После правок появится кнопка "
@@ -2910,8 +2911,85 @@ async def cmd_squad(message: types.Message):
     await message.answer(squad_text(g, sp), reply_markup=squad_markup(g))
 
 
-def candidates_for(g: dict, pdata: dict) -> list:
-    return [n for n in sorted_player_names(pdata) if not _find_in_squad(g, n)]
+ADD_PAGE_SIZE = 30          # кнопок игроков на странице меню добавления (по 2 в ряд)
+GUEST_BATCH_MAX = 20        # разумная защита: сколько имён можно добавить одним сообщением
+
+
+def known_players(sp: dict) -> list:
+    """Известные игроки для меню добавления: есть в статистике и сыграли хотя бы одну игру (членство в Telegram-чате и голос в опросе
+    не важны). Имя — каноническое, как в статистике; дубли после нормализации (регистр, ё/е, пробелы) не повторяются."""
+    seen, out = set(), []
+    for name, rec in sp.items():
+        if not isinstance(rec, dict) or (rec.get("games") or 0) < 1:
+            continue
+        k = norm_key(name)
+        if k not in seen:
+            seen.add(k)
+            out.append(name)
+    return sorted(out, key=norm_key)
+
+
+def candidates_for(g: dict, pdata: dict, sp: dict | None = None) -> list:
+    """Кого можно предложить кнопками: все известные игроки (см. known_players), которых ещё нет в текущих командах."""
+    if sp is None:
+        sp = stats_players_of(load_stats())
+    return [n for n in known_players(sp) if not _find_in_squad(g, n)]
+
+
+def plural_players(n: int) -> str:
+    return "игрок" if n % 10 == 1 and n % 100 != 11 else ("игрока" if n % 10 in (2, 3, 4) and not 12 <= n % 100 <= 14 else "игроков")
+
+
+def add_menu(g: dict, names: list, page: int, header: str):
+    """Меню выбора игрока: известные игроки кнопками (с листанием) + «Добавить нового гостя». Индекс в callback — индекс в полном списке."""
+    pages = max(1, (len(names) + ADD_PAGE_SIZE - 1) // ADD_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * ADD_PAGE_SIZE
+    buttons = [btn(n, f"sq:ai:{g['rev']}:{start + i}") for i, n in enumerate(names[start:start + ADD_PAGE_SIZE])]
+    rows = chunk_rows(buttons, 2)
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(btn("◀️", f"sq:pg:{g['rev']}:{page - 1}"))
+        nav.append(btn(f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(btn("▶️", f"sq:pg:{g['rev']}:{page + 1}"))
+        rows.append(nav)
+    rows.append([btn("✍️ Добавить нового гостя", f"sq:ag:{g['rev']}")])
+    rows.append([btn("⬅️ Назад", "sq:menu")])
+    text = header + (f"\n\nИзвестных игроков вне состава: {len(names)}." if names else "\n\nИзвестных игроков вне состава нет — добавьте нового гостя.")
+    return text, kb(rows)
+
+
+def split_guest_entries(text: str) -> list:
+    """«Иван, Пётр от Вадима 2.3, Сергей» → [(имя, рейтинг|None)]; разделители — запятая, точка с запятой, перенос строки."""
+    parts = [p for p in re.split(r"[,;\n]+", text) if p.strip()]
+    if not parts:
+        raise ValueError("Не понял имя. Формат: Имя или несколько имён через запятую (рейтинг необязателен: Имя 2.3).")
+    if len(parts) > GUEST_BATCH_MAX:
+        raise ValueError(f"Слишком много имён за раз (максимум {GUEST_BATCH_MAX}).")
+    return [parse_guest_text(p) for p in parts]
+
+
+def squad_add_batch(g: dict, entries: list, pdata: dict, sp: dict):
+    """Пакетное добавление: каждый человек сопоставляется с известным игроком (статистика/реестр, штатная нормализация имён) и только
+    потом считается новым гостем; дубли и уже стоящие в составе пропускаются. Каждый кладётся в наименьшую РАЗРЕШЁННУЮ команду
+    (правило цвета соблюдается), команды не пересобираются — это отдельная кнопка. → (добавленные [(имя, гость, известный, как введено)], пропущенные [текст])."""
+    added, skipped, seen = [], [], set()
+    for raw, rating in entries:
+        canon = resolve_name(raw, sp, pdata["players"])
+        k = norm_key(canon)
+        if k in seen:
+            skipped.append(f"{canon} — дубль во введённом списке")
+            continue
+        seen.add(k)
+        if _find_in_squad(g, canon):
+            skipped.append(f"{canon} — уже в составе")
+            continue
+        known = bool(find_key(canon, sp)) or bool(find_key(canon, pdata["players"]))
+        squad_add(g, canon, smallest_allowed_team(g, canon), rating, not known)
+        added.append((canon, not known, known, raw))
+    return added, skipped
 
 
 def team_buttons(g: dict, sp: dict, prefix: str) -> list:
@@ -2953,9 +3031,25 @@ async def handle_squad_guest_text(message, st, text):
     g = load_game()
     if not g or g["id"] != st["gid"] or g["rev"] != st["rev"] or not g.get("pending"):
         raise ValueError("Состав изменился — начните действие заново (⚙️ /состав).")
-    name, rating = parse_guest_text(text)
     pdata = load_players()
     sp = stats_players_of(load_stats())
+    entries = split_guest_entries(text)
+    if len(entries) > 1:
+        if g["pending"].get("op") != "add":
+            raise ValueError("Для замены нужен один игрок — введите одно имя.")
+        added, skipped = squad_add_batch(g, entries, pdata, sp)
+        if not added:
+            raise ValueError("Никого не добавил:\n• " + "\n• ".join(skipped))
+        g["pending"] = None
+        save_game(g)
+        notes = [f"«{raw.strip()}» — известный игрок, добавлен как «{n}»" for n, guest, known, raw in added if known and raw.strip() != n]
+        notes += skipped
+        header = f"✅ Добавлено: {len(added)} {plural_players(len(added))} — {', '.join(a[0] for a in added)}"
+        if notes:
+            header += "\n" + "\n".join("• " + s for s in notes)
+        header += "\nНажмите «🔁 Пересобрать команды», чтобы выровнять баланс."
+        return await message.answer(squad_text(g, sp, header), reply_markup=squad_markup(g))
+    name, rating = entries[0]
     canon = resolve_name(name, sp, pdata["players"])
     if _find_in_squad(g, canon):
         raise ValueError(f"«{canon}» уже в составе.")
@@ -2983,7 +3077,7 @@ async def cb_squad(query: types.CallbackQuery):
     except DataCorrupted as e:
         return await report_data_error(e, query=query)
     # все шаги с выбором по индексу несут ревизию: после изменения состава старые кнопки не действуют
-    indexed = {"rm", "ro", "ai", "at", "ar", "mp", "mr", "ag", "rb"}
+    indexed = {"rm", "ro", "ai", "at", "ar", "mp", "mr", "ag", "rb", "pg"}
     if action in indexed and int(parts[2]) != g["rev"]:
         await query.answer("Состав уже изменился — откройте заново.", show_alert=True)
         return await show_squad(query)
@@ -3005,10 +3099,14 @@ async def cb_squad(query: types.CallbackQuery):
         elif action == "adm":
             g["pending"] = {"op": "add"}
             save_game(g)
-            names = candidates_for(g, pdata)
-            buttons = [btn(n, f"sq:ai:{g['rev']}:{i}") for i, n in enumerate(names)]
-            rows = chunk_rows(buttons, 2) + [[btn("🧑‍🤝‍🧑 Гость (ввести имя)", f"sq:ag:{g['rev']}")], [btn("⬅️ Назад", "sq:menu")]]
-            await edit("Кого добавить? Выберите игрока или добавьте гостя.", kb(rows))
+            text, markup = add_menu(g, candidates_for(g, pdata, sp), 0,
+                                    "➕ Кого добавить? Известные игроки (сыграли хотя бы одну игру) — кнопками, новый человек — «Добавить нового гостя».")
+            await edit(text, markup)
+        elif action == "pg":
+            op = (g.get("pending") or {}).get("op")
+            head = f"Вместо {g['pending'].get('out')} — кто?" if op == "replace" else "➕ Кого добавить?"
+            text, markup = add_menu(g, candidates_for(g, pdata, sp), int(parts[3]), head)
+            await edit(text, markup)
         elif action == "rpm":
             buttons = [btn(f"{TEAM_ICONS[ti]} {n}", f"sq:ro:{g['rev']}:{i}") for i, (ti, n) in enumerate(squad_flat(g))]
             await edit("Кого заменяем (выбывает)?", kb(chunk_rows(buttons, 2) + [[btn("⬅️ Назад", "sq:menu")]]))
@@ -3016,14 +3114,12 @@ async def cb_squad(query: types.CallbackQuery):
             _, out_name = squad_flat(g)[int(parts[3])]
             g["pending"] = {"op": "replace", "out": out_name}
             save_game(g)
-            names = candidates_for(g, pdata)
-            buttons = [btn(n, f"sq:ai:{g['rev']}:{i}") for i, n in enumerate(names)]
-            rows = chunk_rows(buttons, 2) + [[btn("🧑‍🤝‍🧑 Гость (ввести имя)", f"sq:ag:{g['rev']}")], [btn("⬅️ Назад", "sq:menu")]]
-            await edit(f"Вместо {out_name} — кто?", kb(rows))
+            text, markup = add_menu(g, candidates_for(g, pdata, sp), 0, f"Вместо {out_name} — кто?")
+            await edit(text, markup)
         elif action == "ai":
             if not g.get("pending"):
                 raise ValueError("Начните действие заново.")
-            name = candidates_for(g, pdata)[int(parts[3])]
+            name = candidates_for(g, pdata, sp)[int(parts[3])]
             g["pending"].update({"in": name, "rating": None, "guest": False})
             save_game(g)
             await after_choose_incoming(edit, g, sp)
@@ -3031,9 +3127,13 @@ async def cb_squad(query: types.CallbackQuery):
             if not g.get("pending"):
                 raise ValueError("Начните действие заново.")
             AWAITING[OWNER_ID] = {"kind": "squad_guest", "gid": g["id"], "rev": g["rev"]}
-            await edit("Отправьте имя гостя, при желании с рейтингом: Алексей или Алексей 2.3\n"
-                       "Без рейтинга и статистики будет использован средний коэффициент игроков. Отмена — /отмена.",
-                       kb([[btn("⬅️ Назад", "sq:menu")]]))
+            if (g.get("pending") or {}).get("op") == "replace":
+                hint = ("Отправьте имя игрока, при желании с рейтингом: Алексей или Алексей 2.3\n"
+                        "Без рейтинга и статистики будет использован средний коэффициент игроков. Отмена — /отмена.")
+            else:
+                hint = ("Введите одно или несколько имён через запятую.\nНапример:\nИван, Пётр от Вадима, Сергей\n\n"
+                        "Рейтинг необязателен (Имя 2.3). Известные игроки из статистики распознаются автоматически, дублей не будет. Отмена — /отмена.")
+            await edit(hint, kb([[btn("⬅️ Назад", "sq:menu")]]))
         elif action == "at":
             p = g.get("pending") or {}
             squad_add(g, p["in"], int(parts[3]), p.get("rating"), p.get("guest", False))
