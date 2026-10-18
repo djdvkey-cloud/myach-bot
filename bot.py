@@ -25,7 +25,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # Будущие даты в номере не использовать. История: 2026-10-01 (меню, игроки в /data, фактический состав); 2026-10-02 (нумерация игр,
 # История игр, публикация статистики, редактирование игрока); 2026-10-03 … 2026-10-06 — версии с заранее проставленными датами
 # (архив игр №1–4, /отменить без освобождения номера); начиная с 2026-10-03.1 — по реальной дате деплоя.
-BOT_VERSION = "2026-10-18.4"
+BOT_VERSION = "2026-10-18.5"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -907,6 +907,26 @@ def team_banned(name: str, team_idx: int) -> bool:
     return bool(colors) and 0 <= team_idx < len(TEAM_COLORS) and TEAM_COLORS[team_idx] in colors
 
 
+TEAM_BAN_DISPLAY = {norm_key("Ковалёв М."): "Ковалёв М."}
+TEAM_COLOR_ADJ = {"белые": "Белой", "чёрные": "Чёрной", "красные": "Красной"}
+
+
+def check_team_allowed(name: str, team_idx: int):
+    """Единая проверка для ВСЕХ способов изменения состава: нарушающее правило действие не выполняется (ValueError с понятным текстом)."""
+    if team_banned(name, team_idx):
+        color = TEAM_COLORS[team_idx]
+        raise ValueError(f"{TEAM_BAN_DISPLAY.get(norm_key(name), name)} не может играть в {TEAM_COLOR_ADJ.get(color, color)} команде.")
+
+
+def smallest_allowed_team(g: dict, name: str, sizes=None) -> int:
+    """Индекс наименьшей команды, в которую игроку разрешено попасть (для «добавить и пересобрать»)."""
+    sizes = sizes or [len(t) for t in g["teams"]]
+    opts = [i for i in range(len(sizes)) if not team_banned(name, i)]
+    if not opts:
+        raise ValueError(f"Для {TEAM_BAN_DISPLAY.get(norm_key(name), name)} нет разрешённой команды.")
+    return min(opts, key=lambda i: sizes[i])
+
+
 def has_color_bans(players: list) -> bool:
     return any(norm_key(p[0] if isinstance(p, (tuple, list)) else p) in TEAM_COLOR_BANS for p in players)
 
@@ -1744,6 +1764,7 @@ def squad_add(g: dict, name: str, team_idx: int, rating=None, guest=False):
         raise ValueError(f"«{name}» уже в составе.")
     if not 0 <= team_idx < len(g["teams"]):
         raise ValueError("Нет такой команды.")
+    check_team_allowed(name, team_idx)
     g["teams"][team_idx].append(name)
     _register_guest(g, name, rating, guest)
     _log(g, type="add", name=name, team=team_idx + 1, guest=guest, mode="place")
@@ -1757,6 +1778,7 @@ def squad_replace_in_place(g: dict, out_name: str, new_name: str, rating=None, g
     if not loc:
         raise ValueError(f"«{out_name}» нет в составе.")
     ti, pos = loc
+    check_team_allowed(new_name, ti)
     outgoing = g["teams"][ti][pos]
     g["teams"][ti][pos] = new_name
     _register_guest(g, new_name, rating, guest)
@@ -1785,6 +1807,9 @@ def squad_rebuild(g: dict, stats_players: dict, reason: str = "rebuild") -> bool
     else:
         teams, _ = split_teams(players, team_count_for(len(names)))
         g["split_history"] = [teams_fingerprint(teams)]
+    for ti, team in enumerate(teams):
+        for n, _k in team:
+            check_team_allowed(n, ti)                                   # страховка: правило цвета выполняется для любого результата деления
     g["teams"] = [[n for n, _ in team] for team in teams]
     _log(g, type="rebuild", reason=reason)
     return True
@@ -1797,8 +1822,10 @@ def squad_replace_rebuild(g: dict, out_name: str, new_name: str, stats_players: 
     if not loc:
         raise ValueError(f"«{out_name}» нет в составе.")
     ti, pos = loc
+    sizes = [len(t) for t in g["teams"]]
+    sizes[ti] -= 1
+    smallest = smallest_allowed_team(g, new_name, sizes)             # проверка до любых изменений состава
     outgoing = g["teams"][ti].pop(pos)
-    smallest = min(range(len(g["teams"])), key=lambda i: len(g["teams"][i]))
     g["teams"][smallest].append(new_name)
     _register_guest(g, new_name, rating, guest)
     squad_rebuild(g, stats_players, reason="replace")
@@ -1941,7 +1968,7 @@ HELP_SECTIONS = {
         "➕ добавить (игрока или гостя), ➖ убрать, 🔄 заменить. Замена: «📌 Поставить на его место» "
         "(та же команда, остальные не меняются) или «🔄 Пересобрать команды» (заново по коэффициентам). "
         "«Пересобрать команды» (🔁) каждый раз выдаёт ДРУГОЙ, примерно так же сбалансированный вариант: текущий состав и несколько последних показанных не повторяются; "
-        "если равноценной альтернативы нет, бот так и скажет и оставит состав. Ковалёв М. по жёсткому правилу никогда не попадает в красных. "
+        "если равноценной альтернативы нет, бот так и скажет и оставит состав. Ковалёв М. по жёсткому правилу никогда не попадает в красных — ни при делении и пересборке, ни при ручном «добавить в команду», «на его место» или замене (такое действие не выполняется, бот пишет «Ковалёв М. не может играть в Красной команде»). "
         "Первоначальный состав сохраняется, история изменений доступна. После правок появится кнопка "
         "«📢 Опубликовать обновлённый состав».\n\n"
         "Ручной вариант для всех: /составы Иванов, Петров, ... — разбить список (в фактический состав "
@@ -3015,7 +3042,7 @@ async def cb_squad(query: types.CallbackQuery):
             await show_squad(query, f"➕ {p['in']} добавлен.")
         elif action == "ar":
             p = g.get("pending") or {}
-            t = int(min(range(len(g["teams"])), key=lambda i: len(g["teams"][i])))
+            t = smallest_allowed_team(g, p["in"])
             squad_add(g, p["in"], t, p.get("rating"), p.get("guest", False))
             squad_rebuild(g, sp, reason="add")
             g["pending"] = None
