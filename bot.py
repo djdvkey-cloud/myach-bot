@@ -4310,9 +4310,97 @@ def normalize_data_permissions():
     except Exception as e:
         print(f"[DEBUG] normalize_data_permissions: {type(e).__name__}: {e}", flush=True)
 
+# ===== ВРЕМЕННО (one-shot, удалить следующим коммитом): дата игры №7 22.10.2026 → 19.10.2026 =====
+FIX7_OLD, FIX7_NEW = "2026-10-22", "2026-10-19"
+FIX7_MARKER = ".fix_game7_date_20261019_done"
+
+
+def fix_game7_date() -> str:
+    """Меняет ТОЛЬКО games[number=7].date. Статистика, составы, счёт, текущая игра и poll_state не затрагиваются.
+    Синхронная (без await): до запуска опроса и обработчиков. Любое несоответствие — ничего не пишется, ERROR в лог."""
+    marker = os.path.join(DATA_DIR, FIX7_MARKER)
+    if os.path.exists(marker):
+        print("[FIX7_DATE] уже выполнено (marker есть), ничего не меняю", flush=True)
+        return "marker"
+    watched = [STATS_FILE, GAME_FILE, GAME_ARCHIVE_FILE, POLL_STATE_FILE, PLAYERS_FILE, GUESTS_FILE, PAST_DRAFT_FILE, META_FILE]
+    try:
+        games_raw = _read_bytes(GAMES_FILE)
+        if games_raw is None:
+            raise ValueError("games.json отсутствует")
+        data = json.loads(games_raw.decode("utf-8"))
+        validate_games(data)
+        sevens = [g for g in data["games"] if g.get("number") == 7]
+        if len(sevens) != 1:
+            raise ValueError(f"игр с номером 7: {len(sevens)}, ожидалась ровно одна")
+        g7 = sevens[0]
+        if g7["date"] == FIX7_NEW:
+            print(f"[FIX7_DATE] игра №7 уже {FIX7_NEW}, ничего не меняю", flush=True)
+            return "already"
+        if g7["date"] != FIX7_OLD:
+            raise ValueError(f"дата игры №7 = {g7['date']}, ожидалась {FIX7_OLD}")
+        if g7.get("status") == "reverted" or not g7.get("teams"):
+            raise ValueError("игра №7 отменена или без составов")
+        if any(g.get("date") == FIX7_NEW for g in data["games"]):
+            raise ValueError(f"игра на {FIX7_NEW} уже есть")
+        if any(g["number"] < 7 and g["date"] >= FIX7_NEW for g in data["games"]):
+            raise ValueError(f"есть игра с номером меньше 7 и датой не раньше {FIX7_NEW}")
+        before_hash = {p: hashlib.sha256(_read_bytes(p) or b"").hexdigest() if os.path.exists(p) else None for p in watched}
+        expected = json.loads(json.dumps(data))
+        next(g for g in expected["games"] if g["number"] == 7)["date"] = FIX7_NEW
+        stamp = datetime.datetime.now(YEKB_TZ).strftime("%Y%m%d-%H%M%S")
+        bdir = os.path.join(DATA_DIR, "backups_pre_fix_game7_date", stamp)
+        os.makedirs(bdir, exist_ok=True)
+        for p in [GAMES_FILE] + watched:
+            raw = _read_bytes(p)
+            if raw is None:
+                continue
+            dst = os.path.join(bdir, os.path.basename(p))
+            with open(dst, "wb") as f:
+                f.write(raw)
+            if _read_bytes(dst) != raw:
+                raise RuntimeError(f"backup {os.path.basename(p)} не совпал")
+        print(f"[FIX7_DATE] backup: {bdir}", flush=True)
+    except Exception as e:
+        print(f"[FIX7_DATE] ERROR preflight, ничего не изменено: {type(e).__name__}: {e}", flush=True)
+        return "error"
+    try:
+        save_json(GAMES_FILE, expected)
+        after = json.loads(_read_bytes(GAMES_FILE).decode("utf-8"))
+        if after != expected:
+            raise RuntimeError("games.json после записи не совпал с ожидаемым")
+        for k in set(data) | set(after):
+            if k != "games" and data.get(k) != after.get(k):
+                raise RuntimeError(f"изменилось поле {k}")
+        for a, b in zip(sorted(data["games"], key=lambda g: g["number"]), sorted(after["games"], key=lambda g: g["number"])):
+            if a["number"] == 7:
+                if {k: v for k, v in a.items() if k != "date"} != {k: v for k, v in b.items() if k != "date"} or b["date"] != FIX7_NEW:
+                    raise RuntimeError("игра №7: изменилось не только поле date")
+            elif a != b:
+                raise RuntimeError(f"изменилась игра №{a['number']}")
+        if len(after["games"]) != len(data["games"]) or sum(1 for g in after["games"] if g["number"] == 7) != 1:
+            raise RuntimeError("число игр или дубль №7")
+        if sum(1 for g in after["games"] if g["date"] == FIX7_NEW) != 1:
+            raise RuntimeError("на новой дате не одна игра")
+        after_hash = {p: hashlib.sha256(_read_bytes(p) or b"").hexdigest() if os.path.exists(p) else None for p in watched}
+        diff = [os.path.basename(p) for p in watched if before_hash[p] != after_hash[p]]
+        if diff:
+            raise RuntimeError(f"изменились посторонние файлы: {diff}")
+    except Exception as e:
+        _restore_bytes({GAMES_FILE: games_raw})
+        print(f"[FIX7_DATE] ERROR после записи, games.json возвращён как был: {type(e).__name__}: {e}", flush=True)
+        return "error"
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"old": FIX7_OLD, "new": FIX7_NEW, "at": now_iso(), "backup": bdir}, ensure_ascii=False))
+    print(f"[FIX7_DATE] OK\nFIX7_DATE OK\nold={FIX7_OLD}\nnew={FIX7_NEW}\nstats_unchanged=true\n"
+          "active_game_unchanged=true\npoll_state_unchanged=true", flush=True)
+    return "done"
+# ===== конец временного one-shot =====
+
+
 async def main():
     print(f"Постоянный запуск бота {datetime.datetime.now(YEKB_TZ)} версия {BOT_VERSION}")
     normalize_data_permissions()
+    fix_game7_date()   # ВРЕМЕННО
     menu = await setup_menu()
     await notify_started(menu)
     await notify_archive()
