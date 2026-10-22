@@ -25,7 +25,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # Будущие даты в номере не использовать. История: 2026-10-01 (меню, игроки в /data, фактический состав); 2026-10-02 (нумерация игр,
 # История игр, публикация статистики, редактирование игрока); 2026-10-03 … 2026-10-06 — версии с заранее проставленными датами
 # (архив игр №1–4, /отменить без освобождения номера); начиная с 2026-10-03.1 — по реальной дате деплоя.
-BOT_VERSION = "2026-10-18.7"
+BOT_VERSION = "2026-10-22.1"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -486,6 +486,8 @@ def apply_confirmed_aliases() -> list:
 
 # Канонические данные игрока, подтверждённые Дмитрием: один человек, одно имя, один username, один pid.
 CANONICAL_PLAYERS = [
+    # stats — слепок статистики на момент первой привязки (= его строка в архиве игры №4). Статистика только растёт,
+    # поэтому он нижняя граница и проверяется ОДИН раз, до первого подтверждения (флаг "canonical" в записи игрока).
     {"name": "Моргун А.", "old": "Alexandr", "username": "Footmor", "aliases": ["alexandr"], "stats": (1, 4, 3)},
 ]
 
@@ -512,12 +514,14 @@ def canonicalize_players() -> tuple:
         rec = data["players"][row]
         skey = find_key(name, sp) or find_key(old, sp)
         have = tuple(sp[skey].get(k, 0) for k in ("games", "goals", "assists")) if skey else None
-        if have != spec["stats"]:
-            problems.append(f"статистика «{skey or name}»: {have}, ожидалось (И, Г, П) {spec['stats']}")
+        if not rec.get("canonical") and (have is None or any(h < w for h, w in zip(have, spec["stats"]))):
+            problems.append(f"статистика «{skey or name}»: {have}, ожидалось не меньше (И, Г, П) {spec['stats']}")
             continue
         for other, orec in data["players"].items():
             if other != row and uname.lower() in (x.lower() for x in orec["usernames"]):
                 problems.append(f"@{uname} уже принадлежит другому игроку «{other}»")
+            if other != row and set(rec["ids"]) & set(orec["ids"]):
+                problems.append(f"Telegram ID игрока «{name}» записан и у «{other}»")
         if problems:
             continue
         spec_changes.append((spec, row, rec, skey))
@@ -542,9 +546,12 @@ def canonicalize_players() -> tuple:
             if alias not in (x.lower() for x in rec["aliases"]):
                 rec["aliases"].append(alias)
                 touched = True
+        if not rec.get("canonical"):
+            rec["canonical"] = True                  # дальше привязка не зависит от статистики; Telegram ID (если есть) — главный ключ
+            touched = True
         if touched:
             save_players(data)
-            changed_lines.append(f"«{name}»: username @{uname}, алиас «{spec['old']}»")
+            changed_lines.append(f"«{name}»: username @{uname}, алиас «{spec['old']}», привязка подтверждена")
     return ("changed" if changed_lines else "ok"), changed_lines
 
 
@@ -1230,14 +1237,16 @@ def match_player(data: dict, user_id, username: str, display: str) -> str | None
     for name, rec in data["players"].items():
         if user_id is not None and user_id in rec.get("ids", []):
             return name
+    # Закреплённый игрок с известным Telegram ID: чужой ID не получает его по username/отображаемому имени
+    locked = {name for name, rec in data["players"].items() if user_id is not None and rec.get("canonical") and rec.get("ids")}
     if uname:
         for name, rec in data["players"].items():
-            if uname in (u.lower() for u in rec.get("usernames", [])):
+            if name not in locked and uname in (u.lower() for u in rec.get("usernames", [])):
                 return name
     disp = (display or "").strip().lower()
     if disp:
         for name, rec in data["players"].items():
-            if disp in (a.lower() for a in rec.get("aliases", [])):
+            if name not in locked and disp in (a.lower() for a in rec.get("aliases", [])):
                 return name
     return None
 

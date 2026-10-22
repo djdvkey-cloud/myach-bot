@@ -137,10 +137,10 @@ class Canonicalize(CanonBase):
         self.assertIn("@Footmor уже принадлежит другому игроку «Ларионов М.»", lines[0])
         self.assertEqual(before, (read_bytes(B.PLAYERS_FILE), read_bytes(B.STATS_FILE)))
 
-    def test_conflict_stats_differ(self):
+    def test_conflict_stats_below_snapshot_before_first_confirmation(self):
         self.production_after_alias_merge()
         stats = self.read_stats()[str(CHAT)]["players"]
-        stats["Моргун А."]["games"] = 2
+        stats["Моргун А."]["games"] = 0
         self.write_stats(stats)
         before = read_bytes(B.PLAYERS_FILE)
         status, lines = B.canonicalize_players()
@@ -188,6 +188,79 @@ class Canonicalize(CanonBase):
         self.assertIn("Нужно решение Дмитрия", text)
 
 
+class StableAfterNewGames(CanonBase):
+    """Слепок (1,4,3) — нижняя граница до первого подтверждения; после него новые игры привязку не ломают."""
+
+    def grow(self, games, goals, assists):
+        stats = self.read_stats()[str(CHAT)]["players"]
+        stats["Моргун А."].update(games=games, goals=goals, assists=assists)
+        self.write_stats(stats)
+
+    def test_stats_grew_before_first_confirmation_is_not_a_conflict(self):
+        pid = self.production_after_alias_merge()
+        self.grow(2, 7, 4)                                           # как в production: слепок (1,4,3) устарел
+        stats_before = read_bytes(B.STATS_FILE)
+        names_before = sorted(B.load_players()["players"])
+        status, lines = B.canonicalize_players()
+        self.assertEqual(status, "changed")
+        rec = B.load_players()["players"]["Моргун А."]
+        self.assertEqual((rec["pid"], rec["usernames"], rec["canonical"]), (pid, ["Footmor"], True))
+        self.assertEqual(stats_before, read_bytes(B.STATS_FILE))                           # статистика осталась (2,7,4)
+        self.assertEqual(self.read_stats()[str(CHAT)]["players"]["Моргун А."], {"games": 2, "goals": 7, "assists": 4})
+        self.assertEqual(sorted(B.load_players()["players"]), names_before)                # ни Alexandr, ни Footmor, ни нового игрока
+        self.assertNotIn("Alexandr", B.load_players()["players"])
+
+    def test_next_games_do_not_break_confirmed_binding(self):
+        self.production_after_alias_merge()
+        B.canonicalize_players()
+        for g in ((2, 7, 4), (3, 9, 4), (4, 9, 6)):
+            self.grow(*g)
+            self.assertEqual(B.canonicalize_players(), ("ok", []))
+        self.assertEqual([n for n in B.load_players()["players"] if "Моргун" in n or n == "Alexandr"], ["Моргун А."])
+
+    def test_confirmed_binding_survives_even_if_stats_reset(self):
+        self.production_after_alias_merge()
+        B.canonicalize_players()
+        self.grow(0, 0, 0)
+        self.assertEqual(B.canonicalize_players(), ("ok", []))
+
+    def test_same_user_id_every_spelling_resolves_to_one_player(self):
+        self.production_after_alias_merge()
+        B.players_bind("Моргун А.", user_id=777)
+        self.grow(2, 7, 4)
+        B.canonicalize_players()
+        n = len(B.load_players()["players"])
+        for username, display in (("Footmor", ""), ("", "Alexandr"), ("new_name", "Другое Имя")):
+            self.assertEqual(B.match_player(B.load_players(), 777, username, display), "Моргун А.")
+        self.assertEqual(len(B.load_players()["players"]), n)
+
+    def test_other_user_id_cannot_take_confirmed_player_by_username_or_name(self):
+        self.production_after_alias_merge()
+        B.players_bind("Моргун А.", user_id=777)
+        B.canonicalize_players()
+        data = B.load_players()
+        self.assertIsNone(B.match_player(data, 999, "Footmor", "Alexandr"))
+        self.assertIsNone(B.match_player(data, 999, "", "Alexandr"))
+        self.assertEqual(B.match_player(data, 777, "", ""), "Моргун А.")
+
+    def test_without_known_id_old_matching_still_works(self):
+        self.production_after_alias_merge()
+        B.canonicalize_players()
+        data = B.load_players()
+        self.assertEqual(B.match_player(data, 999, "Footmor", ""), "Моргун А.")            # ID ещё не записан — как раньше
+        self.assertEqual(B.match_player(data, None, "", "Alexandr"), "Моргун А.")
+
+    def test_same_telegram_id_in_two_records_is_a_conflict(self):
+        self.production_after_alias_merge()
+        B.players_bind("Моргун А.", user_id=777)
+        B.players_bind("Ларионов М.", user_id=777)
+        before = read_bytes(B.PLAYERS_FILE)
+        status, lines = B.canonicalize_players()
+        self.assertEqual(status, "conflict")
+        self.assertIn("Telegram ID", lines[0])
+        self.assertEqual(before, read_bytes(B.PLAYERS_FILE))
+
+
 class StartupWiring(Base):
     async def test_main_runs_archive_then_canonicalization_at_startup(self):
         import types as pytypes
@@ -214,7 +287,7 @@ class Versioning(Base):
         self.assertIsNotNone(m, B.BOT_VERSION)
         day = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         self.assertLessEqual(day, datetime.date.today())
-        self.assertEqual(B.BOT_VERSION, "2026-10-18.7")
+        self.assertEqual(B.BOT_VERSION, "2026-10-22.1")
 
     async def test_startup_message_shows_version(self):
         report = await B.setup_menu()
