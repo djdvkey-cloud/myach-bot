@@ -4536,6 +4536,73 @@ def normalize_data_permissions():
         print(f"[DEBUG] normalize_data_permissions: {type(e).__name__}: {e}", flush=True)
 
 
+def apply_production_fixes_20261031() -> bool:
+    """Однократный выпуск: штатные функции, точный preflight и полный rollback."""
+    if os.environ.get("APPLY_PRODUCTION_FIXES_20261031") != "yes":
+        return False
+    marker = os.path.join(DATA_DIR, ".production_fixes_20261031_done.json")
+    if os.path.exists(marker):
+        print("[PROD FIX] already", flush=True)
+        return False
+    expected_hashes = {
+        GAMES_FILE: "744b6691802cf73e32a643b2ed18b0fe5b23c60c75cf998f902bed7ac23fb136",
+        PLAYERS_FILE: "36f2291c2d236e705fd00c972024f7b5a3b46c7998cbc9597d461731bf24b7f9",
+        STATS_FILE: "3def062cd6b081a558d29a1fa23dcf8736cf8864b47cb58dbfc37320a1b923c2",
+    }
+    snapshots = {path: _read_bytes(path) for path in expected_hashes}
+    actual_hashes = {path: hashlib.sha256(raw).hexdigest() for path, raw in snapshots.items()}
+    if actual_hashes != expected_hashes:
+        print("[PROD FIX] ABORTED: live Data changed after verified backup", flush=True)
+        return False
+    try:
+        games_before = json.loads(snapshots[GAMES_FILE].decode("utf-8"))
+        players_before = json.loads(snapshots[PLAYERS_FILE].decode("utf-8"))
+        stats_before = json.loads(snapshots[STATS_FILE].decode("utf-8"))
+        game8 = [g for g in games_before["games"] if g.get("number") == 8]
+        if len(games_before["games"]) != 8 or len(game8) != 1 or game8[0].get("date") != "2026-10-31":
+            raise ValueError("ожидались ровно игры №1–8 и дата №8 2026-10-31")
+        if find_key("Азиз", players_before["players"]):
+            raise ValueError("Азиз уже есть в players.json")
+        aziz_stats = []
+        for section in stats_before.values():
+            if not isinstance(section, dict) or not isinstance(section.get("players"), dict):
+                continue
+            key = find_key("Азиз", section["players"])
+            if key:
+                aziz_stats.append((key, section["players"][key]))
+        if aziz_stats != [("Азиз", {"games": 1, "goals": 1, "assists": 0})]:
+            raise ValueError("историческая статистика Азиза не совпала с проверенным preflight")
+        aziz_key = aziz_stats[0][0]
+
+        expected_games = json.loads(snapshots[GAMES_FILE].decode("utf-8"))
+        next(g for g in expected_games["games"] if g.get("number") == 8)["date"] = "2026-10-26"
+        pid = players_before["next_pid"]
+        expected_players = json.loads(snapshots[PLAYERS_FILE].decode("utf-8"))
+        expected_players["players"][aziz_key] = {"usernames": [], "ids": [], "aliases": [], "pid": pid}
+        expected_players["next_pid"] = pid + 1
+
+        correct_game_date(8, "2026-10-31", "2026-10-26")
+        registered_name = players_add(aziz_key)
+        registered_pid = load_players()["players"][registered_name]["pid"]
+        if (registered_name, registered_pid) != (aziz_key, pid):
+            raise RuntimeError("неожиданный результат регистрации Азиза")
+        if load_games() != expected_games or load_players() != expected_players:
+            raise RuntimeError("post-write сверка games/players не прошла")
+        if _read_bytes(STATS_FILE) != snapshots[STATS_FILE]:
+            raise RuntimeError("stats.json изменился")
+        save_json(marker, {
+            "applied_at": now_iso(), "game8_date": "2026-10-26",
+            "registered": registered_name, "pid": registered_pid,
+            "stats_sha256": expected_hashes[STATS_FILE],
+        })
+        print("[PROD FIX] OK: game8 date 2026-10-31 -> 2026-10-26; Азиз registered; stats unchanged", flush=True)
+        return True
+    except BaseException as e:
+        _restore_bytes(snapshots)
+        print(f"[PROD FIX] ROLLBACK: {type(e).__name__}: {e}", flush=True)
+        return False
+
+
 def validate_data_export(name: str, raw: bytes):
     """Проверяет разрешённый JSON перед read-only выдачей, ничего не записывая."""
     try:
@@ -4609,6 +4676,7 @@ async def start_data_read_server():
 async def main():
     print(f"Постоянный запуск бота {datetime.datetime.now(YEKB_TZ)} версия {BOT_VERSION}")
     normalize_data_permissions()
+    apply_production_fixes_20261031()
     menu = await setup_menu()
     await notify_started(menu)
     await notify_archive()
