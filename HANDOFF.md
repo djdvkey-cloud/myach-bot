@@ -312,3 +312,11 @@ Production: Amvera **`5962008`** (до него `5d7447d`, `7061421`, `9ee0d95`,
 - **Telegram ID.** Если у закреплённого игрока в `ids` есть Telegram ID, `match_player` не отдаёт его чужому ID по username или отображаемому имени (совпадение по ID — как раньше).
   Если ID ещё не записан, сопоставление по username/алиасу работает по-старому. ID появляется при привязке проголосовавшего (`bind_voter`).
 - Статистика, составы, игры и poll_state не менялись. Тесты: `tests/test_canonical.py`, класс `StableAfterNewGames`.
+
+## 17. Production-выпуск дат, Азиза и HTTPS-чтения Data (2026-10-31, версия `2026-10-31`)
+
+- В `main` выпущены исправления даты игры, админ-коррекция существующей даты, восстановление игрока из статистики и защищённое read-only HTTPS-чтение Data. Полный набор: 340 тестов, OK.
+- Amvera Miami `myach-reserve`: бесплатный домен `https://myach-reserve-djdvkey.mia0.amvera.tech`, `servicePort: 8080`, `DATA_READ_TOKEN` хранится как secret RUN env. Бот проверен: RUNNING, Instances=1, polling без постоянных ошибок.
+- До изменения сохранён проверенный слепок реальных `games.json`, `players.json`, `stats.json` в `C:\Users\User\Documents\myach-bot-work-backups\2026-10-31-live-before-production-fixes`. После изменения — `2026-10-31-live-after-production-fixes`.
+- Production после выпуска: все 8 игр сохранены; у игры №8 изменено только `date` с `2026-10-31` на `2026-10-26`; в `players.json` добавлен только `Азиз` (`pid: 27`, `next_pid: 28`); `stats.json` побайтно не изменился (SHA-256 `3def062cd6b081a558d29a1fa23dcf8736cf8864b47cb58dbfc37320a1b923c2`).
+- Выпускные коммиты: `8cc222d` (исправления), `60c78f7` (порт HTTPS), `12f5074` (одноразовое строго проверяемое применение production-данных). Одноразовый код после успешной сверки удалён; никаких тестовых игр и сообщений в общий Telegram-чат не создавалось.
