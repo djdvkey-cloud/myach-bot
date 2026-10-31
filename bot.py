@@ -6,6 +6,7 @@
 import asyncio
 import datetime
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -16,6 +17,7 @@ import tempfile
 from itertools import combinations
 from zoneinfo import ZoneInfo
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
@@ -25,7 +27,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # Будущие даты в номере не использовать. История: 2026-10-01 (меню, игроки в /data, фактический состав); 2026-10-02 (нумерация игр,
 # История игр, публикация статистики, редактирование игрока); 2026-10-03 … 2026-10-06 — версии с заранее проставленными датами
 # (архив игр №1–4, /отменить без освобождения номера); начиная с 2026-10-03.1 — по реальной дате деплоя.
-BOT_VERSION = "2026-10-22.1"
+BOT_VERSION = "2026-10-31"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -47,6 +49,15 @@ GAME_ARCHIVE_FILE = os.path.join(DATA_DIR, "game_archive.json")
 META_FILE = os.path.join(DATA_DIR, "ui_meta.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 GAMES_FILE = os.path.join(DATA_DIR, "games.json")        # журнал состоявшихся игр (футбольных вечеров) с постоянными номерами
+DATA_READ_NAMES = frozenset({"games.json", "players.json", "game.json", "game_archive.json", "poll_state.json", "stats.json"})
+
+
+def data_read_files() -> dict:
+    """Пути вычисляются при запросе, чтобы DATA_DIR можно было безопасно подменять в тестах."""
+    return {
+        "games.json": GAMES_FILE, "players.json": PLAYERS_FILE, "game.json": GAME_FILE,
+        "game_archive.json": GAME_ARCHIVE_FILE, "poll_state.json": POLL_STATE_FILE, "stats.json": STATS_FILE,
+    }
 # Состоявшиеся игры №1–4: даты заданы Дмитрием. Составы и голы этих игр в проекте не сохранялись — не придумываются.
 HISTORICAL_GAMES = [(1, "2026-09-07"), (2, "2026-09-14"), (3, "2026-09-21"), (4, "2026-09-28")]
 
@@ -655,6 +666,17 @@ def fmt_game_date(iso: str) -> str:
     return f"{iso[8:10]}.{iso[5:7]}.{iso[0:4]}"
 
 
+def parse_game_date_text(raw: str, *, future_ok: bool = False) -> str:
+    m = re.match(r"^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s*$", raw or "")
+    try:
+        day = datetime.date(int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else None
+    except ValueError:
+        day = None
+    if day is None or (not future_ok and day > datetime.datetime.now(YEKB_TZ).date()):
+        raise ValueError("Формат: ДД.ММ.ГГГГ (реальная дата, не позже сегодняшней).")
+    return day.isoformat()
+
+
 def game_title(game: dict) -> str:
     return f"Игра №{game['number']} — {fmt_game_date(game['date'])}"
 
@@ -715,6 +737,16 @@ def record_match_full(players: list, teams=None, date: str | None = None, mode=N
         raise NeedGameChoice(reverted)
     stats = load_stats()
     registry = load_players()
+    if target is None:
+        if not date:
+            raise ValueError("Дата игры не указана. Выберите дату футбольного вечера перед записью.")
+        try:
+            datetime.date.fromisoformat(date)
+        except (TypeError, ValueError):
+            raise ValueError("Некорректная дата игры.")
+        duplicate = next((g for g in games["games"] if g.get("date") == date), None)
+        if duplicate:
+            raise ValueError(f"На {fmt_game_date(date)} уже записана {game_title(duplicate)}.")
     registered = set(registry["players"])
     chat = stats.setdefault(str(CHAT_ID), {"players": {}, "last": []})
     written = []
@@ -731,7 +763,7 @@ def record_match_full(players: list, teams=None, date: str | None = None, mode=N
     try:
         split = bool(teams)
         game_teams = build_game_teams(teams if split else [[n for n, _, _ in written]], written, registry)
-        day = date or game_date_now()
+        day = target["date"] if target is not None else date
         game = target
         fields = {"teams": game_teams, "split": split, "source": "result" if split else "text", "recorded_at": now_iso()}
         if game is not None:                    # исправленный ввод той же игры: прежний номер и дата
@@ -748,6 +780,36 @@ def record_match_full(players: list, teams=None, date: str | None = None, mode=N
         _restore_bytes(snapshot)
         raise
     return written, game
+
+
+def correct_game_date(number: int, old_date: str, new_date: str) -> dict:
+    """Меняет только date ровно одной существующей игры. save_games делает backup games.json."""
+    try:
+        datetime.date.fromisoformat(new_date)
+    except (TypeError, ValueError):
+        raise ValueError("Некорректная новая дата игры.")
+    games = load_games()
+    found = [g for g in games["games"] if g.get("number") == number]
+    if len(found) != 1:
+        raise ValueError(f"Игра №{number} должна существовать ровно один раз (найдено: {len(found)}).")
+    game = found[0]
+    if game.get("date") != old_date:
+        raise ValueError("Дата игры уже изменилась. Откройте историю заново.")
+    duplicate = next((g for g in games["games"] if g is not game and g.get("date") == new_date), None)
+    if duplicate:
+        raise ValueError(f"На {fmt_game_date(new_date)} уже существует {game_title(duplicate)}.")
+    before = {k: v for k, v in game.items() if k != "date"}
+    snapshot = {GAMES_FILE: _read_bytes(GAMES_FILE)}
+    try:
+        game["date"] = new_date
+        save_games(games)
+        saved = [g for g in load_games()["games"] if g.get("number") == number]
+        if len(saved) != 1 or saved[0].get("date") != new_date or {k: v for k, v in saved[0].items() if k != "date"} != before:
+            raise RuntimeError("Проверка после изменения даты не прошла.")
+    except BaseException:
+        _restore_bytes(snapshot)
+        raise
+    return saved[0]
 
 
 def record_match(players: list, teams=None, date: str | None = None, mode=None) -> list:
@@ -1276,6 +1338,57 @@ def players_add(name: str, username: str | None = None) -> str:
     return name
 
 
+def unregistered_stats_players(data: dict | None = None, stats: dict | None = None) -> list:
+    """Игроки со статистикой, для которых ещё нет карточки в players.json."""
+    data = data or load_players()
+    stats = stats or load_stats()
+    return sorted(
+        (name for name in stats_players_of(stats) if not find_key(name, data["players"])),
+        key=norm_key,
+    )
+
+
+def stats_player_token(name: str) -> str:
+    """Короткий стабильный идентификатор callback без раскрытия имени в payload."""
+    return hashlib.sha256(norm_key(name).encode("utf-8")).hexdigest()[:16]
+
+
+def register_stats_player(token: str) -> tuple[str, int]:
+    """Создаёт карточку ровно для одного существующего игрока статистики.
+
+    Статистика не записывается и не пересчитывается. Совпадающим строкам games.json
+    без pid присваивается новый постоянный pid. При любом сбое оба файла откатываются.
+    """
+    stats = load_stats()
+    data = load_players()
+    candidates = [name for name in unregistered_stats_players(data, stats) if stats_player_token(name) == token]
+    if len(candidates) != 1:
+        raise ValueError("Игрок статистики не найден или список изменился. Откройте раздел заново.")
+    name = candidates[0]
+    if find_key(name, data["players"]):
+        raise ValueError(f"Игрок «{name}» уже зарегистрирован.")
+    games = load_games()
+    pid = data["next_pid"]
+    snapshots = {path: _read_bytes(path) for path in (PLAYERS_FILE, GAMES_FILE)}
+    try:
+        data["players"][name] = {"usernames": [], "ids": [], "aliases": [], "pid": pid}
+        data["next_pid"] = pid + 1
+        changed = False
+        for game in games["games"]:
+            for team in game.get("teams") or []:
+                for row in team:
+                    if row.get("pid") is None and norm_key(row.get("name", "")) == norm_key(name):
+                        row["pid"] = pid
+                        changed = True
+        save_players(data)
+        if changed:
+            save_games(games)
+    except BaseException:
+        _restore_bytes(snapshots)
+        raise
+    return name, pid
+
+
 def players_remove(name: str) -> str:
     data = load_players()
     key = find_key(name, data["players"])
@@ -1717,11 +1830,12 @@ def archive_game(g: dict):
     save_json(GAME_ARCHIVE_FILE, archive[-20:])
 
 
-def new_game(teams: list, ratings: dict | None = None, guests=()) -> dict:
+def new_game(teams: list, ratings: dict | None = None, guests=(), match_date: str | None = None) -> dict:
     names_teams = [[n for n in team] for team in teams]
     return {
         "id": datetime.datetime.now(YEKB_TZ).strftime("%Y%m%d%H%M%S"),
         "created": now_iso(),
+        "match_date": match_date,
         "rev": 1,
         "initial": [list(t) for t in names_teams],
         "teams": names_teams,
@@ -1967,6 +2081,9 @@ HELP_SECTIONS = {
         "(заменить; «-» убрать) или «🏷 Отображаемое имя». У игрока есть постоянный внутренний номер: смена имени "
         "НЕ создаёт нового игрока — статистика, игры, голы, передачи и составы прошлых игр остаются у него. Если новое имя "
         "уже занято, бот откажет (объединить — /переименовать).\n\n"
+        "Если имя уже есть в статистике, но карточки в players.json нет, оно отмечается в списке. В «Редактировать игрока» "
+        "кнопка «из статистики» создаёт только карточку и постоянный pid; статистика не пересчитывается, после чего имя "
+        "редактируется обычным способом.\n\n"
         "Пример: /игрок добавить Иванов П. @ivanov\n\n"
         "Ограничения: удаление игрока не трогает его статистику. Имена сравниваются без учёта "
         "регистра и «ё/е»."
@@ -1997,16 +2114,16 @@ HELP_SECTIONS = {
         "Кнопка «⚽ Внести результат матча» (или /результат). Игроки берутся из ФАКТИЧЕСКОГО состава. "
         "Нажмите на игрока и выставите ⚽ голы и 🎯 передачи кнопками ➖/➕ (по умолчанию 0/0 — "
         "меняйте только тех, кто забил или отдал). Затем «➡️ Далее» — предварительный просмотр. "
-        "Статистика меняется только после «✅ Записать матч». «✏️ Изменить» возвращает к вводу, "
-        "«❌ Отмена» ничего не записывает.\n\n"
-        "Резервный текстовый способ: /матч Иванов 2+1, Петров 0+3, Соломин — «голы+передачи», игрок без "
+        "Перед сохранением бот показывает номер, дату игры, участников, голы и передачи. Дату можно изменить; "
+        "статистика меняется только после подтверждения показанной даты.\n\n"
+        "Резервный текстовый способ: /матч ДД.ММ.ГГГГ Иванов 2+1, Петров 0+3, Соломин — «голы+передачи», игрок без "
         "цифр записывается как 0+0. Эта команда доступна и участникам общего чата.\n\n"
         "Каждая записанная игра (весь футбольный вечер) получает постоянный номер: «Игра №5 — 12.10.2026». Номер "
         "дают только фактически записанному вечеру; отменённый вечер не нумеруется. История игр — «📚 История игр» (/история).\n"
         "Отмена: /отменить убирает последнюю записанную игру (одну): статистика откатывается, но НОМЕР игры остаётся за этим вечером и никогда не переиспользуется. "
         "Исправленные данные этой игры можно записать в ту же Игра №N в любое время, без ограничения по срокам: когда есть отменённая игра, "
         "при записи бот спрашивает — «✏️ Исправление» (та же Игра №N, прежние номер и дата) или «🆕 Новый вечер» (следующий номер); "
-        "для /матч — слова «исправление N» или «новый» (/матч исправление 5 Иванов 2+1; /матч новый Иванов 2+1). "
+        "для /матч — слова «исправление N» или «новый» (/матч исправление 5 Иванов 2+1; /матч новый ДД.ММ.ГГГГ Иванов 2+1). "
         "Новый вечер получает следующий номер, номер отменённой игры никому не достаётся.\n\n"
         "🕘 ПРОШЛАЯ ИГРА. Если вечер не записали, а следующая игра уже создана: «🕘 Записать прошлую игру» (или /прошлая). "
         "А) Состав сохранился в архиве — выберите вечер (по одному на вечер, последний состав; пересборки текущей игры не показываются), "
@@ -2042,7 +2159,8 @@ HELP_SECTIONS = {
         "Игры №1–4 (07.09, 14.09, 21.09, 28.09.2026): архив восстановлен вручную по данным Дмитрия — №1 списком участников без "
         "составов команд, №2–4 с командами; голы и передачи в них уже входят в общую статистику и повторно не начисляются. "
         "Начиная с №5 архив пополняется при записи результата («⚽ Внести результат матча» или /матч). "
-        "Журнал хранится в /data/games.json.\n\n"
+        "Журнал хранится в /data/games.json. В карточке игры владелец может исправить только дату: бот показывает "
+        "старую и новую даты, проверяет дубль, делает backup и не пересчитывает статистику.\n\n"
         "Ограничения: игра, записанная через /матч, показывается списком игроков без деления на команды."
     ),
     "pay": (
@@ -2079,7 +2197,7 @@ HELP_ALL_TEXT = "\n".join(HELP_SECTIONS.values())
 
 PLAYER_HELP = (
     "Команды:\n"
-    "/матч Иванов 2+1, Петров 0+3, Соломин — записать игру\n"
+    "/матч ДД.ММ.ГГГГ Иванов 2+1, Петров 0+3, Соломин — записать игру\n"
     "/статистика — таблица\n"
     "/составы Иванов, Петров, ... — разбить на команды\n"
     "/опрос — сразу опубликовать опрос на понедельник (на случай сбоя автоматики)\n"
@@ -2343,13 +2461,16 @@ async def cb_noop(query: types.CallbackQuery):
 # Игроки
 # ============================================================
 
-def players_text(data: dict) -> str:
+def players_text(data: dict, missing: list | None = None) -> str:
     lines = [f"👥 Игроки ({len(data['players'])})"]
     for i, (name, rec) in enumerate(sorted(data["players"].items(), key=lambda kv: norm_key(kv[0])), 1):
         tags = [f"@{u}" for u in rec["usernames"]] + [f"«{a}»" for a in rec["aliases"]]
         if not tags:
             tags = ["без привязки"]
         lines.append(f"{i}. {name} — {', '.join(tags)}")
+    if missing:
+        lines += ["", "⚠️ Без карточки в реестре: " + ", ".join(missing),
+                  "Откройте «Редактировать игрока» и зарегистрируйте нужного игрока из статистики."]
     return "\n".join(lines)
 
 
@@ -2368,9 +2489,10 @@ def players_markup() -> types.InlineKeyboardMarkup:
 async def show_players(query):
     try:
         data = load_players()
+        missing = unregistered_stats_players(data)
     except DataCorrupted as e:
         return await report_data_error(e, query=query)
-    await edit_or_send(query, players_text(data), players_markup())
+    await edit_or_send(query, players_text(data, missing), players_markup())
 
 
 def picker_markup(names: list, prefix: str, back: str) -> types.InlineKeyboardMarkup:
@@ -2401,7 +2523,17 @@ async def cb_players(query: types.CallbackQuery):
                                kb([[btn("⬅️ К игрокам", "m:players")]]))
         elif action == "ed":
             buttons = [btn(n, f"pe:c:{data['players'][n]['pid']}") for n in names]
+            missing = unregistered_stats_players(data)
+            buttons += [btn(f"➕ {n} · из статистики", f"pl:reg:{stats_player_token(n)}") for n in missing]
             await edit_or_send(query, "Кого редактировать?", kb(chunk_rows(buttons, 2) + [[btn("⬅️ Назад", "m:players")]]))
+        elif action == "reg":
+            name, pid = register_stats_player(parts[2])
+            await edit_or_send(
+                query,
+                "✅ Карточка создана для существующего игрока статистики. Голы, передачи и число игр не менялись.\n\n"
+                + player_card_text(load_players(), load_stats(), pid),
+                player_card_markup(pid),
+            )
         elif action == "del":
             await edit_or_send(query, "Кого удалить из списка игроков? (статистика останется)",
                                picker_markup(names, "pl:dp", "m:players"))
@@ -2424,7 +2556,8 @@ async def cmd_players(message: types.Message):
     if not is_owner_private(message):
         return
     try:
-        await message.answer(players_text(load_players()), reply_markup=players_markup())
+        data = load_players()
+        await message.answer(players_text(data, unregistered_stats_players(data)), reply_markup=players_markup())
     except DataCorrupted as e:
         await report_data_error(e, message=message)
 
@@ -2553,14 +2686,36 @@ async def cb_history(query: types.CallbackQuery):
     try:
         if parts[1] == "l":
             await show_history_list(query, int(parts[2]))
+        elif parts[1] == "date":
+            games = load_games()
+            found = [g for g in games["games"] if g.get("number") == int(parts[2])]
+            if len(found) != 1:
+                return await query.answer("Игра должна существовать ровно один раз.", show_alert=True)
+            game = found[0]
+            AWAITING[OWNER_ID] = {"kind": "history_date", "number": game["number"], "old_date": game["date"]}
+            await edit_or_send(query, f"Текущая дата {game_title(game)}.\n\nВведите новую дату: ДД.ММ.ГГГГ\nОтмена — /отмена.",
+                               kb([[btn("⬅️ К игре", f"gh:g:{game['number']}")]]))
+        elif parts[1] == "dateok":
+            number = int(parts[2])
+            old_date = f"{parts[3][0:4]}-{parts[3][4:6]}-{parts[3][6:8]}"
+            new_date = f"{parts[4][0:4]}-{parts[4][4:6]}-{parts[4][6:8]}"
+            game = correct_game_date(number, old_date, new_date)
+            AWAITING.pop(OWNER_ID, None)
+            await edit_or_send(query, f"✅ Дата исправлена: {game_title(game)}.\nИзменено только поле date; статистика не пересчитывалась.",
+                               kb([[btn("📚 К истории", "gh:l:0"), btn("⬅️ Меню", "m:home")]]))
         else:
             games = load_games()
             game = next((g for g in games["games"] if g["number"] == int(parts[2])), None)
             if game is None:
                 return await query.answer("Игра не найдена", show_alert=True)
-            await edit_or_send(query, game_view_text(game, load_players()), kb([[btn("⬅️ К истории", "gh:l:0"), btn("⬅️ Меню", "m:home")]]))
+            await edit_or_send(query, game_view_text(game, load_players()), kb([
+                [btn("✏️ Исправить дату", f"gh:date:{game['number']}")],
+                [btn("⬅️ К истории", "gh:l:0"), btn("⬅️ Меню", "m:home")],
+            ]))
     except DataCorrupted as e:
         return await report_data_error(e, query=query)
+    except (ValueError, IndexError) as e:
+        return await query.answer(f"⚠️ {e}", show_alert=True)
     await ack(query)
 
 
@@ -2690,6 +2845,29 @@ async def owner_text_input(message: types.Message):
                                  reply_markup=player_card_markup(pid))
         elif kind == "squad_guest":
             await handle_squad_guest_text(message, st, text)
+        elif kind == "result_date":
+            g = load_game()
+            if not g or g.get("id") != st.get("gid") or g.get("result_recorded"):
+                raise ValueError("Черновик результата устарел. Откройте ввод заново.")
+            g["match_date"] = parse_game_date_text(text)
+            save_game(g)
+            await message.answer(result_preview_text(g), reply_markup=result_preview_markup(g))
+        elif kind == "history_date":
+            new_date = parse_game_date_text(text)
+            games = load_games()
+            found = [g for g in games["games"] if g.get("number") == st["number"]]
+            if len(found) != 1 or found[0].get("date") != st["old_date"]:
+                raise ValueError("Игра изменилась. Откройте историю заново.")
+            duplicate = next((g for g in games["games"] if g.get("number") != st["number"] and g.get("date") == new_date), None)
+            if duplicate:
+                raise ValueError(f"На {fmt_game_date(new_date)} уже существует {game_title(duplicate)}.")
+            old_token, new_token = st["old_date"].replace("-", ""), new_date.replace("-", "")
+            await message.answer(
+                f"Исправить дату Игры №{st['number']}?\n\nСтарая дата: {fmt_game_date(st['old_date'])}\n"
+                f"Новая дата: {fmt_game_date(new_date)}\n\nИзменится только поле date в games.json. Статистика, составы и recorded_at не изменятся.",
+                reply_markup=kb([[btn("✅ Подтвердить дату", f"gh:dateok:{st['number']}:{old_token}:{new_token}")],
+                                 [btn("❌ Отмена", f"gh:g:{st['number']}")]]),
+            )
     except DataCorrupted as e:
         await report_data_error(e, message=message)
     except ValueError as e:
@@ -2756,10 +2934,12 @@ async def do_split(reply):
     koefs, _, _ = koef_for_names(names, ratings, sp)
     teams, _ = split_teams([(n, koefs[n]) for n in names], team_count_for(len(names)))
     registered = set(pdata["players"])
+    monday = poll_state_monday(state)
     g = new_game(
         [[n for n, _ in team] for team in teams],
         ratings={n: r for n, r in ratings.items() if r},
         guests=[n for n in names if n not in registered],
+        match_date=monday.isoformat() if monday else None,
     )
     previous = load_game()
     if previous:
@@ -3227,14 +3407,32 @@ def result_list_text(g: dict) -> str:
 
 def result_preview_text(g: dict) -> str:
     entries = result_entries(g)
-    scorers = [(n, gl, a) for n, gl, a in entries if gl or a]
-    others = [n for n, gl, a in entries if not gl and not a]
-    lines = ["🔎 Проверьте результат перед записью", ""]
-    lines += [f"• {n} — ⚽ {gl} 🎯 {a}" for n, gl, a in scorers] or ["Голов и передач нет ни у кого."]
-    if others:
-        lines += ["", "Остальные 0+0: " + ", ".join(others)]
-    lines += ["", f"Всего игроков: {len(entries)}. Статистика изменится только после «Записать матч»."]
+    date = g.get("match_date")
+    games = load_games()
+    number = next_game_number(games)
+    goals, assists = sum(x[1] for x in entries), sum(x[2] for x in entries)
+    lines = [f"⚽ Игра №{number}", f"Дата игры: {fmt_game_date(date) if date else 'не указана'}", "",
+             f"Участники: {len(entries)}", f"Голы: {goals}", f"Передачи: {assists}", "",
+             "Статистика изменится только после подтверждения."]
+    if date:
+        duplicate = next((x for x in games["games"] if x.get("date") == date and x.get("status") != "reverted"), None)
+        if duplicate:
+            lines += ["", f"⛔ На эту дату уже записана {game_title(duplicate)}."]
+    else:
+        lines += ["", "⛔ Сначала укажите дату конкретного футбольного вечера."]
     return "\n".join(lines)
+
+
+def result_preview_markup(g: dict) -> types.InlineKeyboardMarkup:
+    date = g.get("match_date")
+    games = load_games()
+    duplicate = date and next((x for x in games["games"] if x.get("date") == date and x.get("status") != "reverted"), None)
+    rows = []
+    if date and not duplicate:
+        rows.append([btn("✅ Подтвердить запись", f"rs:ok:{g['id']}:{date.replace('-', '')}")])
+    rows += [[btn("✏️ Изменить дату", f"rs:date:{g['id']}")],
+             [btn("⬅️ Вернуться", "rs:menu")]]
+    return kb(rows)
 
 
 async def show_result_menu(query):
@@ -3305,10 +3503,13 @@ async def cb_result(query: types.CallbackQuery):
             text, markup = player_screen(g, int(parts[2]))
             await edit_or_send(query, text, markup)
         elif action == "prev":
-            await edit_or_send(query, result_preview_text(g), kb([
-                [btn("✅ Записать матч", f"rs:ok:{g['id']}")],
-                [btn("✏️ Изменить", "rs:menu"), btn("❌ Отмена", "rs:cancel")],
-            ]))
+            await edit_or_send(query, result_preview_text(g), result_preview_markup(g))
+        elif action == "date":
+            if g["id"] != parts[2]:
+                return await query.answer("Состав устарел. Откройте ввод заново.", show_alert=True)
+            AWAITING[OWNER_ID] = {"kind": "result_date", "gid": g["id"]}
+            await edit_or_send(query, "Введите дату этой игры: ДД.ММ.ГГГГ\nНапример: 26.10.2026\n\nОтмена — /отмена.",
+                               kb([[btn("⬅️ Вернуться", "rs:prev")]]))
         elif action == "cancel":
             g["result"] = None
             save_game(g)
@@ -3322,13 +3523,17 @@ async def cb_result(query: types.CallbackQuery):
                     return await query.answer("Результат уже записан.", show_alert=True)
                 if not g.get("result") or set(g["result"]["roster"]) != set(game_players(g)):
                     return await query.answer("Состав изменился — откройте ввод заново.", show_alert=True)
+                shown_date = parts[3] if len(parts) > 3 else ""
+                if not g.get("match_date") or shown_date != g["match_date"].replace("-", ""):
+                    return await query.answer("Дата изменилась или подтверждение устарело. Проверьте результат заново.", show_alert=True)
                 entries = result_entries(g)
-                mode = "new" if action == "okn" else (int(parts[3]) if action == "okf" else None)
+                mode = "new" if action == "okn" else (int(parts[4]) if action == "okf" else None)
                 try:
-                    written, game = record_match_full(entries, teams=g["teams"], mode=mode)
+                    written, game = record_match_full(entries, teams=g["teams"], date=g["match_date"], mode=mode)
                 except NeedGameChoice as need:          # есть отменённая игра: выбор делает Дмитрий, бот не угадывает
-                    rows = [[btn(f"✏️ Исправление: {game_title(x)}", f"rs:okf:{g['id']}:{x['number']}")] for x in need.reverted]
-                    rows.append([btn(f"🆕 Новый вечер (Игра №{next_game_number(load_games())})", f"rs:okn:{g['id']}")])
+                    token = g["match_date"].replace("-", "")
+                    rows = [[btn(f"✏️ Исправление: {game_title(x)}", f"rs:okf:{g['id']}:{token}:{x['number']}")] for x in need.reverted]
+                    rows.append([btn(f"🆕 Новый вечер (Игра №{next_game_number(load_games())})", f"rs:okn:{g['id']}:{token}")])
                     rows.append([btn("✏️ Изменить", "rs:menu"), btn("❌ Отмена", "rs:cancel")])
                     await ack(query)
                     return await edit_or_send(
@@ -3941,7 +4146,7 @@ async def cmd_match(message: types.Message, command: CommandObject):
         return
     usage = (
         "Формат:\n"
-        "/матч Иванов 2+1, Петров 0+3, Соломин\n\n"
+        "/матч ДД.ММ.ГГГГ Иванов 2+1, Петров 0+3, Соломин\n\n"
         "Если есть игра с отменёнными данными, добавьте слово: «исправление N» (та же Игра №N) или «новый» (новый вечер).\n\n"
         "Гол = 2 очка, пас = 1 очко."
     )
@@ -3956,17 +4161,28 @@ async def cmd_match(message: types.Message, command: CommandObject):
         m = re.match(r"^(?:исправление|исправить|fix)\s+(\d+)\s*", args, re.IGNORECASE)
         if m:
             args, mode = args[m.end():], int(m.group(1))
+    explicit_date = None
+    dm = re.match(r"^(\d{1,2}\.\d{1,2}\.\d{4})\s+", args)
+    if dm:
+        try:
+            explicit_date = parse_game_date_text(dm.group(1))
+        except ValueError as e:
+            return await message.answer(f"⚠️ {e}")
+        args = args[dm.end():]
+    if not isinstance(mode, int) and not explicit_date:
+        await message.answer("⚠️ Для новой игры укажите дату футбольного вечера явно.\n" + usage)
+        return
     players, errors = parse_match_line(args)
     if not players:
         await message.answer(f"Не понял игроков.\n{usage}")
         return
     try:
-        written, game = record_match_full(players, mode=mode)
+        written, game = record_match_full(players, date=explicit_date, mode=mode)
     except NeedGameChoice as need:
         lines = ["Есть игра, данные которой были отменены. Укажите, куда записать результат:"]
         for x in need.reverted:
             lines.append(f"• исправление {game_title(x)}: /матч исправление {x['number']} Иванов 2+1, Петров 0+3")
-        lines.append(f"• новый вечер (Игра №{next_game_number(load_games())}): /матч новый Иванов 2+1, Петров 0+3")
+        lines.append(f"• новый вечер (Игра №{next_game_number(load_games())}): /матч новый ДД.ММ.ГГГГ Иванов 2+1, Петров 0+3")
         await message.answer("\n".join(lines))
         return
     except ValueError as e:
@@ -4319,6 +4535,77 @@ def normalize_data_permissions():
     except Exception as e:
         print(f"[DEBUG] normalize_data_permissions: {type(e).__name__}: {e}", flush=True)
 
+
+def validate_data_export(name: str, raw: bytes):
+    """Проверяет разрешённый JSON перед read-only выдачей, ничего не записывая."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        if name == "games.json":
+            validate_games(data)
+        elif name == "players.json":
+            validate_players(data)
+        elif name == "stats.json":
+            normalize_stats(data)
+        elif not isinstance(data, (dict, list)):
+            raise ValueError("ожидался JSON-объект или список")
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
+        raise ValueError(f"файл {name} повреждён или имеет неверную структуру: {e}") from e
+
+
+def create_data_read_app(token: str) -> web.Application:
+    """Узкий аутентифицированный read-only экспорт allowlist-файлов из Data."""
+    if len(token) < 32:
+        raise ValueError("DATA_READ_TOKEN должен содержать не менее 32 символов")
+
+    async def download(request: web.Request):
+        supplied = request.headers.get("Authorization", "")
+        expected = "Bearer " + token
+        if not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+            raise web.HTTPUnauthorized(text="Unauthorized", headers={"Cache-Control": "no-store"})
+        name = request.match_info["name"]
+        path = data_read_files().get(name) if name in DATA_READ_NAMES else None
+        if path is None:
+            raise web.HTTPNotFound(text="Not found", headers={"Cache-Control": "no-store"})
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            stat = os.stat(path)
+            validate_data_export(name, raw)
+        except FileNotFoundError:
+            raise web.HTTPNotFound(text="Not found", headers={"Cache-Control": "no-store"})
+        except (OSError, ValueError):
+            # Детали пути/содержимого наружу и в access-log не выводятся.
+            raise web.HTTPServiceUnavailable(text="Data unavailable", headers={"Cache-Control": "no-store"})
+        return web.Response(
+            body=raw,
+            content_type="application/json",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": f'attachment; filename="{name}"',
+                "ETag": '"' + hashlib.sha256(raw).hexdigest() + '"',
+                "X-Data-Mtime": str(int(stat.st_mtime)),
+            },
+        )
+
+    app = web.Application(client_max_size=1024 * 1024)
+    app.router.add_get("/codex-data/{name}", download, allow_head=True)
+    return app
+
+
+async def start_data_read_server():
+    """Включается только явно заданным production-секретом; без него порт не открывается."""
+    token = os.environ.get("DATA_READ_TOKEN", "")
+    if not token:
+        return None
+    app = create_data_read_app(token)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    port = int(os.environ.get("DATA_READ_PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[DATA READ] read-only allowlist endpoint started on port {port}")
+    return runner
+
 async def main():
     print(f"Постоянный запуск бота {datetime.datetime.now(YEKB_TZ)} версия {BOT_VERSION}")
     normalize_data_permissions()
@@ -4326,11 +4613,19 @@ async def main():
     await notify_started(menu)
     await notify_archive()
     await notify_canonical()
+    try:
+        data_runner = await start_data_read_server()
+    except Exception as e:
+        # Ошибка диагностического read-only канала не должна останавливать Telegram polling.
+        print(f"[DATA READ] endpoint unavailable: {type(e).__name__}: {e}")
+        data_runner = None
     scheduler = asyncio.create_task(poll_scheduler())
     try:
         await dp.start_polling(bot)
     finally:
         scheduler.cancel()
+        if data_runner is not None:
+            await data_runner.cleanup()
         await bot.session.close()
 
 

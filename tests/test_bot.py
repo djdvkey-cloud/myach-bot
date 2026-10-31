@@ -177,7 +177,10 @@ class Base(unittest.IsolatedAsyncioTestCase):
         B._PUBLISHED_MONDAYS.clear()
 
     def tearDown(self):
-        for p in self.patches:
+        # Patches may be stacked for the same attribute (notably datetime in
+        # schedule tests), so unwind them in LIFO order to avoid leaking an
+        # older fake into later test cases.
+        for p in reversed(self.patches):
             p.stop()
 
     def write_stats(self, players, last=None):
@@ -237,12 +240,12 @@ class StatsSafety(Base):
         with self.assertRaises(B.DataCorrupted):
             B.load_stats()
         m = owner_msg()
-        await B.cmd_match(m, cmd("матч", "Иванов 1+0"))
+        await B.cmd_match(m, cmd("матч", "05.10.2026 Иванов 1+0"))
         await B.cmd_undo(m)
         await B.cmd_rename(m, cmd("переименовать", "А = Б"))
         await B.cmd_reset(m, cmd("обнулить", "да"))
         with self.assertRaises(B.DataCorrupted):
-            B.record_match([("Иванов", 1, 0)])
+            B.record_match([("Иванов", 1, 0)], date="2026-10-05")
         self.assertEqual(read_bytes(B.STATS_FILE), raw)   # исходник не тронут
         self.assertTrue(all("повреждены" in t for t, _ in m.answers), m.answers)
         self.assertEqual(len(m.answers), 4)
@@ -283,7 +286,7 @@ class StatsSafety(Base):
     async def test_existing_data_not_lost_on_normal_ops(self):
         self.write_stats({"Иванов": {"games": 5, "goals": 4, "assists": 3},
                           "Петров": {"games": 2, "goals": 0, "assists": 1}}, last=[["Иванов", 1, 0]])
-        await B.cmd_match(owner_msg(), cmd("матч", "Иванов 2+1, Сидоров"))
+        await B.cmd_match(owner_msg(), cmd("матч", "05.10.2026 Иванов 2+1, Сидоров"))
         p = self.read_stats()[str(CHAT)]["players"]
         self.assertEqual(p["Иванов"], {"games": 6, "goals": 6, "assists": 4})
         self.assertEqual(p["Петров"], {"games": 2, "goals": 0, "assists": 1})
@@ -336,7 +339,7 @@ class NamesAndPlayers(Base):
 
     async def test_match_uses_existing_spelling_no_duplicate(self):
         self.write_stats({"Ковалев М.": {"games": 3, "goals": 1, "assists": 0}})
-        await B.cmd_match(owner_msg(), cmd("матч", "Ковалёв М. 1+0"))
+        await B.cmd_match(owner_msg(), cmd("матч", "05.10.2026 Ковалёв М. 1+0"))
         players = self.read_stats()[str(CHAT)]["players"]
         self.assertEqual(list(players), ["Ковалев М."])
         self.assertEqual(players["Ковалев М."]["games"], 4)
@@ -811,7 +814,7 @@ class SplitFlow(Base):
 class ResultFlow(Base):
     def prep(self, published=False):
         setup_stats(self, {"A": (4, 4, 2), "B": (4, 1, 1), "C": (2, 0, 0), "D": (3, 1, 0)})
-        g = B.new_game([["A", "B"], ["C", "Гость"]], guests=["Гость"])
+        g = B.new_game([["A", "B"], ["C", "Гость"]], guests=["Гость"], match_date="2026-10-05")
         B.save_game(g)
         return g
 
@@ -829,12 +832,13 @@ class ResultFlow(Base):
         q = FakeQuery("rs:prev")
         await B.cb_result(q)
         text, markup = q.message.edits[-1]
-        self.assertIn("A — ⚽ 2 🎯 1", text)
-        self.assertIn("Гость — ⚽ 0 🎯 1", text)
-        self.assertIn("Остальные 0+0: B, C", text)
+        self.assertIn("Дата игры: 05.10.2026", text)
+        self.assertIn("Участники: 4", text)
+        self.assertIn("Голы: 2", text)
+        self.assertIn("Передачи: 2", text)
         texts = all_button_text(markup)
-        self.assertEqual([t for t in texts if "Записать" in t or "Изменить" in t or "Отмена" in t],
-                         ["✅ Записать матч", "✏️ Изменить", "❌ Отмена"])
+        self.assertEqual([t for t in texts if "Подтвердить" in t or "Изменить" in t or "Отмена" in t],
+                         ["✅ Подтвердить запись", "✏️ Изменить дату"])
         # до подтверждения статистика не менялась
         self.assertEqual(self.read_stats()[str(CHAT)]["players"]["A"]["games"], 4)
         ok = [d for d in all_button_data(markup) if d.startswith("rs:ok")][0]
@@ -894,7 +898,7 @@ class ResultFlow(Base):
     async def test_text_match_command_remains(self):
         self.prep()
         m = owner_msg()
-        await B.cmd_match(m, cmd("матч", "A 1+1, Гость"))
+        await B.cmd_match(m, cmd("матч", "05.10.2026 A 1+1, Гость"))
         self.assertIn("Записал игру (2 чел.)", m.answers[-1][0])
 
 

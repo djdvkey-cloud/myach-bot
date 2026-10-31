@@ -75,7 +75,7 @@ class Numbering(GamesBase):
     async def test_text_match_command_also_numbers_game(self):
         self.setup_roster()
         m = owner_msg()
-        await B.cmd_match(m, cmd("матч", "Иванов И. 1+0, Петров П."))
+        await B.cmd_match(m, cmd("матч", "05.10.2026 Иванов И. 1+0, Петров П."))
         self.assertIn("Записал игру (2 чел.)", m.answers[-1][0])
         self.assertIn("Игра №5 — ", m.answers[-1][0])
 
@@ -166,14 +166,14 @@ class Numbering(GamesBase):
         await B.cmd_undo(owner_msg())
         before = read_bytes(B.STATS_FILE)
         m = owner_msg()
-        await B.cmd_match(m, cmd("матч", "Иванов И. 1+0"))
+        await B.cmd_match(m, cmd("матч", "05.10.2026 Иванов И. 1+0"))
         self.assertIn("/матч исправление 5", m.answers[-1][0])
         self.assertIn("/матч новый", m.answers[-1][0])
         self.assertIn("Игра №6", m.answers[-1][0])
         self.assertEqual(before, read_bytes(B.STATS_FILE))
         await B.cmd_match(m, cmd("матч", "исправление 5 Иванов И. 1+0, Петров П. 0+1"))
         self.assertIn("Игра №5 — 05.10.2026", m.answers[-1][0])
-        await B.cmd_match(m, cmd("матч", "новый Иванов И. 2+0"))
+        await B.cmd_match(m, cmd("матч", "новый 12.10.2026 Иванов И. 2+0"))
         self.assertIn("Игра №6 — ", m.answers[-1][0])
         self.assertEqual(sorted(g["number"] for g in B.load_games()["games"]), [1, 2, 3, 4, 5, 6])
 
@@ -218,7 +218,7 @@ class Numbering(GamesBase):
 
     async def test_buttons_flow_can_be_reentered_after_undo_with_same_number(self):
         self.setup_roster()
-        g = B.new_game([["Иванов И.", "Сидоров С."], ["Петров П."]])
+        g = B.new_game([["Иванов И.", "Сидоров С."], ["Петров П."]], match_date="2026-10-05")
         B.save_game(g)
         await B.cb_panel(FakeQuery("m:result"))
         await B.cb_result(FakeQuery("rs:g+:0"))
@@ -322,7 +322,7 @@ class StatsHeader(GamesBase):
         text, _ = await self.stats_answer()
         self.assertTrue(text.startswith("📊 Статистика (сыграно игр: 4)"), text[:60])
         # ввод результата отменён → число то же
-        g = B.new_game([["Иванов И.", "Сидоров С."], ["Петров П."]])
+        g = B.new_game([["Иванов И.", "Сидоров С."], ["Петров П."]], match_date="2026-10-05")
         B.save_game(g)
         await B.cb_panel(FakeQuery("m:result"))
         await B.cb_result(FakeQuery("rs:g+:0"))
@@ -412,7 +412,7 @@ class History(GamesBase):
 
     async def test_text_match_game_listed_without_split(self):
         self.setup_roster()
-        await B.cmd_match(owner_msg(), cmd("матч", "Иванов И. 2+1, Петров П."))
+        await B.cmd_match(owner_msg(), cmd("матч", "05.10.2026 Иванов И. 2+1, Петров П."))
         q = FakeQuery("gh:g:5")
         await B.cb_history(q)
         text = q.message.edits[-1][0]
