@@ -276,7 +276,7 @@ class StartupWiring(Base):
         async def menu():
             return {}
         self.fake.session = pytypes.SimpleNamespace(close=noop)
-        with mock.patch.object(B, "setup_menu", menu),                 mock.patch.object(B, "notify_started", noop),                 mock.patch.object(B, "notify_archive", lambda: spy("archive")),                 mock.patch.object(B, "notify_canonical", lambda: spy("canonical")),                 mock.patch.object(B, "poll_scheduler", noop),                 mock.patch.object(B.dp, "start_polling", noop):
+        with mock.patch.object(B, "setup_menu", menu),                 mock.patch.object(B, "notify_started", noop),                 mock.patch.object(B, "notify_archive", lambda: spy("archive")),                 mock.patch.object(B, "notify_canonical", lambda: spy("canonical")),                 mock.patch.object(B, "process_monthly_reports", noop),                 mock.patch.object(B, "poll_scheduler", noop),                 mock.patch.object(B.dp, "start_polling", noop):
             await B.main()
         self.assertEqual(calls, ["archive", "canonical"])
 
@@ -287,7 +287,7 @@ class Versioning(Base):
         self.assertIsNotNone(m, B.BOT_VERSION)
         day = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         self.assertLessEqual(day, datetime.date.today())
-        self.assertEqual(B.BOT_VERSION, "2026-11-01.1")
+        self.assertEqual(B.BOT_VERSION, "2026-11-01.2")
 
     async def test_startup_message_shows_version(self):
         report = await B.setup_menu()

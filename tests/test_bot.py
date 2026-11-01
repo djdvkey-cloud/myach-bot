@@ -48,6 +48,7 @@ class FakeBot:
         if self.fail_send:
             raise RuntimeError("network down")
         self.sent.append((chat_id, text))
+        return pytypes.SimpleNamespace(message_id=len(self.sent), chat=pytypes.SimpleNamespace(id=chat_id))
 
     async def send_photo(self, chat_id, photo, caption=None, **kw):
         if self.fail_send:
@@ -180,6 +181,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
             "PLAYERS_FILE": "players.json", "GAME_FILE": "game.json",
             "GAME_ARCHIVE_FILE": "game_archive.json", "GAMES_FILE": "games.json", "META_FILE": "ui_meta.json",
             "CARD_DRAFTS_FILE": "card_drafts.json",
+            "MONTHLY_REPORTS_FILE": "monthly_reports.json",
             "BACKUP_DIR": "backups",
         }
         for name, val in paths.items():

@@ -29,7 +29,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # Будущие даты в номере не использовать. История: 2026-10-01 (меню, игроки в /data, фактический состав); 2026-10-02 (нумерация игр,
 # История игр, публикация статистики, редактирование игрока); 2026-10-03 … 2026-10-06 — версии с заранее проставленными датами
 # (архив игр №1–4, /отменить без освобождения номера); начиная с 2026-10-03.1 — по реальной дате деплоя.
-BOT_VERSION = "2026-11-01.1"
+BOT_VERSION = "2026-11-01.2"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -52,6 +52,7 @@ META_FILE = os.path.join(DATA_DIR, "ui_meta.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 GAMES_FILE = os.path.join(DATA_DIR, "games.json")        # журнал состоявшихся игр (футбольных вечеров) с постоянными номерами
 CARD_DRAFTS_FILE = os.path.join(DATA_DIR, "card_drafts.json")
+MONTHLY_REPORTS_FILE = os.path.join(DATA_DIR, "monthly_reports.json")
 DATA_READ_NAMES = frozenset({"games.json", "players.json", "game.json", "game_archive.json", "poll_state.json", "stats.json"})
 
 OCTOBER_CARD_TEXT = (
@@ -99,6 +100,8 @@ OCTOBER_RATING_HTML = (
     "<b>Спасибо всем за игру!</b> "
 )
 CARD_CAPTION_LIMIT = 1024
+MONTHLY_AUTOMATION_START = "2026-11"
+MONTHLY_MESSAGE_LIMIT = 3900
 
 
 def data_read_files() -> dict:
@@ -202,6 +205,7 @@ dp = Dispatcher()
 POLL_LOCK = asyncio.Lock()
 PUBLISH_LOCK = asyncio.Lock()
 CARD_PUBLISH_LOCK = asyncio.Lock()
+MONTHLY_LOCK = asyncio.Lock()
 RECORD_LOCK = asyncio.Lock()
 # Ожидание текстового ввода от Дмитрия (в памяти: после перезапуска
 # просто начать действие заново).
@@ -405,6 +409,206 @@ def new_card_draft(photo_file_id: str, photo_unique_id: str, caption_text: str, 
         "caption_html": caption_html,
         "status": "draft",
         "created_at": now_iso(),
+    }
+
+
+# ============================================================
+# Ежемесячные итоги: отдельное постоянное хранилище и расчёт
+# ============================================================
+
+def validate_monthly_store(data: dict):
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("months"), dict):
+        raise ValueError("ожидался объект месячных итогов версии 1 с months")
+    for month, entry in data["months"].items():
+        if not re.fullmatch(r"\d{4}-\d{2}", month) or not isinstance(entry, dict):
+            raise ValueError("неверная запись месяца")
+        if entry.get("status", "open") not in ("open", "closed", "needs_tie_decision"):
+            raise ValueError(f"{month}: неверный status")
+        if not isinstance(entry.get("missing", {}), dict):
+            raise ValueError(f"{month}: missing не объект")
+        if entry.get("report") is not None and not isinstance(entry["report"], dict):
+            raise ValueError(f"{month}: report не объект")
+
+
+def load_monthly_store() -> dict:
+    data = load_json_strict(MONTHLY_REPORTS_FILE)
+    if data is _MISSING:
+        return {"version": 1, "months": {}}
+    try:
+        validate_monthly_store(data)
+    except ValueError as e:
+        raise DataCorrupted(MONTHLY_REPORTS_FILE, str(e))
+    return data
+
+
+def save_monthly_store(data: dict):
+    validate_monthly_store(data)
+    backup_file(MONTHLY_REPORTS_FILE, "monthly-reports")
+    save_json(MONTHLY_REPORTS_FILE, data)
+
+
+def month_bounds(month: str) -> tuple[datetime.date, datetime.date]:
+    try:
+        first = datetime.date.fromisoformat(month + "-01")
+    except ValueError as e:
+        raise ValueError("Месяц должен быть в формате YYYY-MM") from e
+    next_first = (first.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+    return first, next_first - datetime.timedelta(days=1)
+
+
+def month_mondays(month: str) -> list[str]:
+    first, last = month_bounds(month)
+    day = first + datetime.timedelta(days=(7 - first.weekday()) % 7)
+    result = []
+    while day <= last:
+        result.append(day.isoformat())
+        day += datetime.timedelta(days=7)
+    return result
+
+
+def active_month_games(games: dict, month: str) -> list[dict]:
+    first, last = month_bounds(month)
+    result = []
+    for game in games.get("games", []):
+        try:
+            day = datetime.date.fromisoformat(game.get("date", ""))
+        except (TypeError, ValueError):
+            continue
+        if not (first <= day <= last):
+            continue
+        if game.get("status") in ("reverted", "cancelled", "annulled") or not isinstance(game.get("teams"), list):
+            continue
+        result.append(game)
+    return sorted(result, key=lambda x: (x["date"], x["number"]))
+
+
+def monthly_registry_maps(players_data: dict) -> tuple[dict, dict]:
+    pid_names, name_pids = {}, {}
+    for name, rec in players_data.get("players", {}).items():
+        pid = rec.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            continue
+        pid_names[pid] = name
+        for candidate in [name, *rec.get("aliases", [])]:
+            name_pids.setdefault(norm_key(candidate), set()).add(pid)
+    return pid_names, name_pids
+
+
+def monthly_resolve_identity(item: dict, pid_names: dict, name_pids: dict) -> tuple[str, int | None, str, bool]:
+    raw_name = item.get("name", "").strip()
+    pid = item.get("pid") if isinstance(item.get("pid"), int) and not isinstance(item.get("pid"), bool) else None
+    ambiguous = False
+    if pid is None:
+        candidates = name_pids.get(norm_key(raw_name), set())
+        if len(candidates) == 1:
+            pid = next(iter(candidates))
+        elif len(candidates) > 1:
+            ambiguous = True
+    identity = f"pid:{pid}" if pid is not None else "guest:" + norm_key(raw_name)
+    return identity, pid, pid_names.get(pid, raw_name), ambiguous
+
+
+def monthly_source_snapshot(games: list[dict], players_data: dict) -> list[dict]:
+    pid_names, name_pids = monthly_registry_maps(players_data)
+    snapshot = []
+    for game in games:
+        rows = []
+        for team in game.get("teams") or []:
+            for row in team:
+                identity, _pid, _name, _ambiguous = monthly_resolve_identity(row, pid_names, name_pids)
+                rows.append({
+                    "identity": identity,
+                    "goals": int(row.get("goals", 0)),
+                    "assists": int(row.get("assists", 0)),
+                })
+        rows.sort(key=lambda x: (x["identity"], x["goals"], x["assists"]))
+        snapshot.append({"number": game["number"], "date": game["date"], "players": rows})
+    return snapshot
+
+
+def monthly_fingerprint(games: list[dict], players_data: dict) -> str:
+    raw = json.dumps(monthly_source_snapshot(games, players_data), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def monthly_rank_key(row: dict) -> tuple:
+    return (-row["points"], -row["goals"], -row["assists"], -row["k"])
+
+
+def calculate_monthly_report(month: str, games_data: dict, players_data: dict) -> dict:
+    games = active_month_games(games_data, month)
+    pid_names, name_pids = monthly_registry_maps(players_data)
+    totals, review = {}, []
+    for game in games:
+        per_game = {}
+        for team in game.get("teams") or []:
+            for item in team:
+                raw_name = item.get("name", "").strip()
+                identity, pid, display_name, ambiguous = monthly_resolve_identity(item, pid_names, name_pids)
+                row = per_game.setdefault(identity, {"pid": pid, "name": display_name, "goals": 0, "assists": 0})
+                row["goals"] += int(item.get("goals", 0))
+                row["assists"] += int(item.get("assists", 0))
+                if pid is None:
+                    reason = "неоднозначное имя" if ambiguous else "нет pid"
+                    note = f"{raw_name}: {reason} (игра №{game['number']})"
+                    if note not in review:
+                        review.append(note)
+                elif pid not in pid_names:
+                    note = f"{raw_name}: pid {pid} отсутствует в players.json (игра №{game['number']})"
+                    if note not in review:
+                        review.append(note)
+        for identity, item in per_game.items():
+            row = totals.setdefault(identity, {
+                "identity": identity, "pid": item["pid"], "name": item["name"],
+                "games": 0, "goals": 0, "assists": 0,
+            })
+            row["games"] += 1
+            row["goals"] += item["goals"]
+            row["assists"] += item["assists"]
+    table = []
+    for row in totals.values():
+        row = dict(row)
+        row["points"] = 2 * row["goals"] + row["assists"]
+        row["k"] = row["points"] / row["games"] if row["games"] else 0.0
+        table.append(row)
+    table.sort(key=lambda row: (monthly_rank_key(row), row["identity"]))
+    previous_metrics, previous_rank = None, 0
+    for index, row in enumerate(table, 1):
+        metrics = (row["points"], row["goals"], row["assists"], row["k"])
+        if metrics != previous_metrics:
+            previous_rank = index
+        row["rank"] = previous_rank
+        previous_metrics = metrics
+    required = len(games)
+    eligible = [dict(row) for row in table if row["games"] == required] if required else []
+    prize_ties = []
+    pos = 0
+    while pos < len(eligible):
+        end = pos + 1
+        key = monthly_rank_key(eligible[pos])
+        while end < len(eligible) and monthly_rank_key(eligible[end]) == key:
+            end += 1
+        if end - pos > 1 and pos < 3:
+            prize_ties.append([row["identity"] for row in eligible[pos:end]])
+        pos = end
+    top3 = [] if prize_ties else eligible[:3]
+    prize_ids = {row["identity"] for row in top3}
+    return {
+        "month": month,
+        "game_count": required,
+        "games": [{"number": g["number"], "date": g["date"]} for g in games],
+        "fingerprint": monthly_fingerprint(games, players_data),
+        "source_snapshot": monthly_source_snapshot(games, players_data),
+        "participants": len(table),
+        "eligible_count": len(eligible),
+        "ineligible_count": len(table) - len(eligible),
+        "review": review,
+        "prize_ties": prize_ties,
+        "top3": top3,
+        "non_prize": [dict(row) for row in table if row["identity"] not in prize_ids],
+        "eligible": eligible,
+        "overall": table,
+        "calculated_at": now_iso(),
     }
 
 
@@ -1902,6 +2106,10 @@ async def poll_scheduler():
             await maybe_send_poll()
         except Exception as e:                      # любая неожиданная ошибка не должна останавливать расписание
             print(f"[POLL] ошибка планировщика: {type(e).__name__}: {e}")
+        try:
+            await process_monthly_reports()
+        except Exception as e:
+            print(f"[MONTH] ошибка планировщика: {type(e).__name__}: {e}")
         tick += 1
         if tick % 30 == 0:
             print(f"[DEBUG] планировщик жив, тик {tick}, {datetime.datetime.now(YEKB_TZ):%d.%m.%Y %H:%M}")
@@ -2308,6 +2516,18 @@ HELP_SECTIONS = {
         "нажатие блокируется. Если Telegram не подтвердил результат, бот не повторяет отправку вслепую. Опубликованная "
         "запись и message_id сохраняются. Черновик можно отменить до начала публикации."
     ),
+    "monthly": (
+        "📅 ИТОГИ МЕСЯЦА\n\n"
+        "Кнопка «📅 Итоги месяца» или /итоги открывает сохранённые расчёты. Источник — поматчевый games.json, "
+        "имена берутся по постоянному pid из players.json; общая stats.json для расчёта не используется. "
+        "Очки = 2 × голы + передачи, K = очки / игры. В призовой ТОП-3 допускаются только сыгравшие во всех "
+        "состоявшихся матчах месяца; общий рейтинг включает всех участников.\n\n"
+        "Начиная с ноября 2026 года после последнего футбольного понедельника бот сам проверяет полноту месяца и "
+        "присылает в личку ТОП-3 и общий рейтинг. Если результата понедельника нет, один раз предлагает отметить, "
+        "что игра не состоялась, или внести результат позже. Октябрь доступен только как предпросмотр без повторной "
+        "рассылки. Изменение закрытой игры не пересчитывает итоги молча: бот сначала спрашивает подтверждение. "
+        "Никаких сообщений в общий чат этот раздел не отправляет."
+    ),
     "misc": (
         "🔧 СЛУЖЕБНЫЕ\n\n"
         "/start — приветствие и панель администратора\n"
@@ -2321,14 +2541,14 @@ HELP_SECTIONS = {
         "игроков и меню.\n\n"
         "Данные в /data: stats.json (статистика), players.json (игроки), poll_state.json (опрос и голоса), "
         "game.json / game_archive.json (фактический состав), games.json (журнал игр с номерами), "
-        "card_drafts.json (черновики карточек), guests.json, backups/.\n\n"
+        "card_drafts.json (черновики карточек), monthly_reports.json (месячные итоги), guests.json, backups/.\n\n"
         "Правило: любая новая admin-функция добавляется в этот Help в том же изменении."
     ),
 }
 HELP_TITLES = {
     "poll": "🗳 Опрос", "players": "👥 Игроки", "split": "⚖️ Составы", "match": "⚽ Матч",
     "stats": "📊 Статистика", "history": "📚 История игр", "pay": "💰 Оплата",
-    "cards": "🖼 Карточки", "misc": "🔧 Служебные",
+    "cards": "🖼 Карточки", "monthly": "📅 Итоги месяца", "misc": "🔧 Служебные",
 }
 HELP_ALL_TEXT = "\n".join(HELP_SECTIONS.values())
 
@@ -2445,6 +2665,7 @@ def main_panel() -> types.InlineKeyboardMarkup:
         [btn("⚽ Внести результат матча", "m:result"), btn("💰 Рассчитать оплату", "m:pay")],
         [btn("📊 Статистика", "m:stats"), btn("📚 История игр", "m:history")],
         [btn("🕘 Записать прошлую игру", "m:past"), btn("🖼 Карточки", "m:cards")],
+        [btn("📅 Итоги месяца", "m:month")],
         [btn("❓ Help", "m:help")],
     ])
 
@@ -2566,6 +2787,8 @@ async def cb_panel(query: types.CallbackQuery):
         await show_past_list(query)
     elif action == "cards":
         await show_latest_card(query.message)
+    elif action == "month":
+        await show_month_menu(query.message)
     elif action == "poll":
         today = datetime.datetime.now(YEKB_TZ).date()
         monday = poll_target_monday(today)
@@ -2594,6 +2817,317 @@ async def cb_panel(query: types.CallbackQuery):
 @dp.callback_query(F.data == "noop")
 async def cb_noop(query: types.CallbackQuery):
     await query.answer("Это действие уже выполнено")
+
+
+# ============================================================
+# Итоги месяца: owner-only просмотр, закрытие и уведомления
+# ============================================================
+
+MONTH_NAMES_RU = ("", "январь", "февраль", "март", "апрель", "май", "июнь",
+                  "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь")
+
+
+def month_title(month: str) -> str:
+    first, _ = month_bounds(month)
+    return f"{MONTH_NAMES_RU[first.month]} {first.year}"
+
+
+def report_with_current_names(report: dict, players: dict) -> dict:
+    pid_names = {rec.get("pid"): name for name, rec in players.get("players", {}).items()
+                 if isinstance(rec.get("pid"), int) and not isinstance(rec.get("pid"), bool)}
+    result = json.loads(json.dumps(report, ensure_ascii=False))
+    for field in ("top3", "non_prize", "eligible", "overall"):
+        for row in result.get(field, []):
+            if row.get("pid") in pid_names:
+                row["name"] = pid_names[row["pid"]]
+    return result
+
+
+def monthly_row_text(row: dict, *, place=True) -> str:
+    prefix = f"{row['rank']}. " if place else "• "
+    return (f"{prefix}{row['name']} — И{row['games']} · Г{row['goals']} · П{row['assists']} · "
+            f"{row['points']} очк. · K {row['k']:.2f}")
+
+
+def monthly_summary_lines(report: dict) -> list[str]:
+    return [
+        f"Матчей: {report['game_count']}",
+        f"Участников: {report['participants']}",
+        f"Допущены ко всем матчам: {report['eligible_count']}",
+        f"Не допущены: {report['ineligible_count']}",
+        "Проверка данных: " + (f"нужна ({len(report['review'])})" if report.get("review") else "не требуется"),
+    ]
+
+
+def monthly_top_text(report: dict) -> str:
+    lines = [f"🏆 ТОП-3 · {month_title(report['month']).upper()}", ""]
+    if not report["game_count"]:
+        lines.append("В этом месяце не было состоявшихся игр. Призовой рейтинг не создан.")
+    elif report.get("prize_ties"):
+        tied = {identity for group in report["prize_ties"] for identity in group}
+        names = [row["name"] for row in report["eligible"] if row["identity"] in tied]
+        lines += ["⚠️ На призовом месте полное равенство. Нужна редакторская очередность Дмитрия:", ", ".join(names)]
+    elif report["top3"]:
+        for place, row in enumerate(report["top3"], 1):
+            item = dict(row)
+            item["rank"] = place
+            lines.append(monthly_row_text(item))
+    else:
+        lines.append("Нет футболистов, сыгравших во всех состоявшихся матчах месяца.")
+    lines += ["", *monthly_summary_lines(report)]
+    if report.get("review"):
+        lines += ["", "⚠️ Требуют проверки:", *[f"• {x}" for x in report["review"][:20]]]
+    return "\n".join(lines)
+
+
+def monthly_overall_chunks(report: dict) -> list[str]:
+    header = [f"📊 ОБЩИЙ РЕЙТИНГ · {month_title(report['month']).upper()}", "", *monthly_summary_lines(report), ""]
+    rows = [monthly_row_text(row) for row in report["overall"]] or ["Состоявшихся игр и участников нет."]
+    chunks, current = [], "\n".join(header)
+    for row in rows:
+        candidate = current + ("\n" if current else "") + row
+        if len(candidate) > MONTHLY_MESSAGE_LIMIT and current:
+            chunks.append(current)
+            current = f"📊 {month_title(report['month'])} · продолжение\n\n{row}"
+        else:
+            current = candidate
+    chunks.append(current)
+    return chunks
+
+
+def monthly_month_entry(store: dict, month: str) -> dict:
+    return store["months"].setdefault(month, {
+        "status": "open", "missing": {}, "missing_notice": None,
+        "notifications": {}, "report": None, "created_at": now_iso(),
+    })
+
+
+def unresolved_month_dates(month: str, games: dict, entry: dict) -> list[str]:
+    played = {g["date"] for g in active_month_games(games, month)}
+    return [day for day in month_mondays(month)
+            if day not in played and entry.get("missing", {}).get(day) != "no_game"]
+
+
+def monthly_missing_markup(days: list[str]) -> types.InlineKeyboardMarkup:
+    rows = []
+    for day in days:
+        token = day.replace("-", "")
+        label = fmt_game_date(day)
+        rows.append([btn(f"❌ {label} · игра не состоялась", f"mo:no:{token}")])
+        rows.append([btn(f"🕘 {label} · результат внесу позже", f"mo:later:{token}")])
+    return kb(rows)
+
+
+async def send_missing_month_notice(month: str, days: list[str], store: dict, entry: dict):
+    signature = hashlib.sha256("|".join(days).encode()).hexdigest()[:16]
+    notice = entry.get("missing_notice") or {}
+    if notice.get("status") in ("sending", "sent", "uncertain"):
+        return
+    entry["missing_notice"] = {"signature": signature, "status": "sending", "started_at": now_iso()}
+    save_monthly_store(store)
+    try:
+        sent = await bot.send_message(
+            OWNER_ID,
+            f"📅 {month_title(month).capitalize()}: не для каждого футбольного понедельника записан результат.\n\n"
+            "Для каждой даты выберите: игра не состоялась или результат будет внесён позже.",
+            reply_markup=monthly_missing_markup(days),
+        )
+    except Exception as e:
+        entry["missing_notice"]["status"] = "uncertain"
+        entry["missing_notice"]["error_at"] = now_iso()
+        save_monthly_store(store)
+        print(f"[MONTH] missing notice {month} not confirmed: {type(e).__name__}")
+        return
+    entry["missing_notice"].update({"status": "sent", "message_id": sent.message_id, "sent_at": now_iso()})
+    save_monthly_store(store)
+
+
+async def send_month_report_messages(month: str, store: dict, entry: dict):
+    report = report_with_current_names(entry["report"], load_players())
+    notifications = entry.setdefault("notifications", {})
+    payloads = [("top", [monthly_top_text(report)]), ("overall", monthly_overall_chunks(report))]
+    for kind, chunks in payloads:
+        state = notifications.get(kind) or {}
+        if state.get("status") in ("sending", "sent", "uncertain"):
+            continue
+        notifications[kind] = {"status": "sending", "started_at": now_iso(), "message_ids": []}
+        save_monthly_store(store)
+        ids = []
+        try:
+            for text in chunks:
+                sent = await bot.send_message(OWNER_ID, text)
+                ids.append(sent.message_id)
+        except Exception as e:
+            notifications[kind].update({"status": "uncertain", "message_ids": ids, "error_at": now_iso()})
+            save_monthly_store(store)
+            print(f"[MONTH] {month} {kind} delivery not confirmed: {type(e).__name__}")
+            continue
+        notifications[kind].update({"status": "sent", "message_ids": ids, "sent_at": now_iso()})
+        save_monthly_store(store)
+    print(f"[MONTH] {month} reports processed; status={entry['status']}")
+
+
+async def notify_month_changed(month: str, fingerprint: str, store: dict, entry: dict):
+    change = entry.get("change_notice") or {}
+    if change.get("fingerprint") == fingerprint and change.get("status") in ("sending", "sent", "uncertain", "dismissed"):
+        return
+    entry["change_notice"] = {"fingerprint": fingerprint, "status": "sending", "started_at": now_iso()}
+    save_monthly_store(store)
+    try:
+        sent = await bot.send_message(
+            OWNER_ID,
+            f"⚠️ Статистика за {month_title(month)} изменилась. Пересчитать итоги?\n\n"
+            "До подтверждения сохранён прежний расчёт и его исходный снимок.",
+            reply_markup=kb([[btn("✅ Пересчитать", f"mo:recalc:{month.replace('-', '')}"),
+                              btn("Оставить прежние", f"mo:keep:{month.replace('-', '')}")]]),
+        )
+    except Exception as e:
+        entry["change_notice"].update({"status": "uncertain", "error_at": now_iso()})
+        save_monthly_store(store)
+        print(f"[MONTH] change notice {month} not confirmed: {type(e).__name__}")
+        return
+    entry["change_notice"].update({"status": "sent", "message_id": sent.message_id, "sent_at": now_iso()})
+    save_monthly_store(store)
+
+
+async def process_monthly_reports(now: datetime.datetime | None = None):
+    now = (now or datetime.datetime.now(YEKB_TZ)).astimezone(YEKB_TZ)
+    async with MONTHLY_LOCK:
+        try:
+            games, players, store = load_games(), load_players(), load_monthly_store()
+        except DataCorrupted as e:
+            print(f"[MONTH] data unavailable: {e}")
+            return
+        # Сначала проверяем уже закрытые месяцы: переименование при том же pid отпечаток не меняет.
+        for month, entry in list(store["months"].items()):
+            if entry.get("report") and entry.get("status") in ("closed", "needs_tie_decision"):
+                current = calculate_monthly_report(month, games, players)
+                if current["fingerprint"] != entry["report"].get("fingerprint"):
+                    await notify_month_changed(month, current["fingerprint"], store, entry)
+        first = datetime.date.fromisoformat(MONTHLY_AUTOMATION_START + "-01")
+        cursor = first
+        while cursor <= now.date().replace(day=1):
+            month = f"{cursor.year:04d}-{cursor.month:02d}"
+            mondays = month_mondays(month)
+            last_monday = datetime.date.fromisoformat(mondays[-1])
+            entry = monthly_month_entry(store, month)
+            if entry.get("status") not in ("closed", "needs_tie_decision"):
+                missing = unresolved_month_dates(month, games, entry)
+                undecided = [day for day in missing if day not in entry.get("missing", {})]
+                played_dates = {g["date"] for g in active_month_games(games, month)}
+                can_check = now.date() > last_monday or last_monday.isoformat() in played_dates
+                if can_check and undecided:
+                    await send_missing_month_notice(month, undecided, store, entry)
+                elif can_check and missing:
+                    pass  # владелец уже выбрал «результат внесу позже»; повторно не напоминаем
+                elif can_check:
+                    report = calculate_monthly_report(month, games, players)
+                    entry["report"] = report
+                    entry["status"] = "needs_tie_decision" if report["prize_ties"] else "closed"
+                    entry["closed_at"] = now_iso()
+                    save_monthly_store(store)
+                    await send_month_report_messages(month, store, entry)
+            year, mon = cursor.year + (cursor.month == 12), cursor.month % 12 + 1
+            cursor = datetime.date(year, mon, 1)
+
+
+def month_view_text(month: str, report: dict | None, entry: dict | None = None) -> str:
+    if report is None:
+        return f"📅 Итоги месяца · {month_title(month)}\n\nРасчёт ещё не закрыт."
+    report = report_with_current_names(report, load_players())
+    status = (entry or {}).get("status", "предпросмотр")
+    lines = [f"📅 Итоги месяца · {month_title(month)}", f"Статус: {status}", "", monthly_top_text(report), "",
+             "ПОЛНЫЙ РЕЙТИНГ", *[monthly_row_text(row) for row in report["overall"]]]
+    return "\n".join(lines)
+
+
+def month_menu_markup(months: list[str]) -> types.InlineKeyboardMarkup:
+    rows = [[btn(month_title(month).capitalize(), f"mo:view:{month.replace('-', '')}")] for month in months]
+    rows.append([btn("⬅️ Меню", "m:home")])
+    return kb(rows)
+
+
+async def show_month_menu(message: types.Message):
+    store = load_monthly_store()
+    months = sorted(set(store["months"]) | {"2026-10"}, reverse=True)
+    await message.answer("📅 Итоги месяца\n\nСохранённые расчёты и октябрьский предпросмотр:", reply_markup=month_menu_markup(months))
+
+
+@dp.message(Command("итоги", "итогимесяца", "month"))
+async def cmd_monthly(message: types.Message):
+    if not is_owner_private(message):
+        return
+    try:
+        await show_month_menu(message)
+    except DataCorrupted as e:
+        await message.answer(f"⚠️ Итоги месяца недоступны: {e.reason}. Файл не изменён.")
+
+
+@dp.callback_query(F.data.startswith("mo:"))
+async def cb_monthly(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    parts = query.data.split(":")
+    try:
+        action = parts[1]
+        if action == "view":
+            month = parts[2][:4] + "-" + parts[2][4:6]
+            store = load_monthly_store()
+            entry = store["months"].get(month)
+            report = entry.get("report") if entry else None
+            if report is None and month == "2026-10":
+                report = calculate_monthly_report(month, load_games(), load_players())
+            text = month_view_text(month, report, entry)
+            if len(text) <= MONTHLY_MESSAGE_LIMIT:
+                await edit_or_send(query, text, month_menu_markup(sorted(set(store["months"]) | {"2026-10"}, reverse=True)))
+            else:
+                await query.message.answer(monthly_top_text(report))
+                for chunk in monthly_overall_chunks(report):
+                    await query.message.answer(chunk)
+            return await ack(query)
+        if action in ("no", "later"):
+            day = parts[2][:4] + "-" + parts[2][4:6] + "-" + parts[2][6:8]
+            month = day[:7]
+            if month < MONTHLY_AUTOMATION_START or day not in month_mondays(month):
+                return await query.answer("Некорректная дата", show_alert=True)
+            store = load_monthly_store()
+            entry = monthly_month_entry(store, month)
+            if entry.get("status") in ("closed", "needs_tie_decision"):
+                return await query.answer("Этот месяц уже закрыт", show_alert=True)
+            entry["missing"][day] = "no_game" if action == "no" else "later"
+            save_monthly_store(store)
+            await query.answer("Сохранено")
+            await process_monthly_reports()
+            return
+        if action in ("recalc", "keep"):
+            month = parts[2][:4] + "-" + parts[2][4:6]
+            store = load_monthly_store()
+            entry = store["months"].get(month)
+            if not entry or not entry.get("report"):
+                return await query.answer("Расчёт не найден", show_alert=True)
+            fingerprint = (entry.get("change_notice") or {}).get("fingerprint")
+            if action == "keep":
+                entry.setdefault("change_notice", {})["status"] = "dismissed"
+                save_monthly_store(store)
+                return await query.answer("Прежний расчёт сохранён")
+            current = calculate_monthly_report(month, load_games(), load_players())
+            if fingerprint and current["fingerprint"] != fingerprint:
+                return await query.answer("Данные снова изменились — откройте раздел заново", show_alert=True)
+            entry.setdefault("revisions", []).append(entry["report"])
+            entry["report"] = current
+            entry["status"] = "needs_tie_decision" if current["prize_ties"] else "closed"
+            entry["notifications"] = {}
+            entry["change_notice"] = None
+            entry["recalculated_at"] = now_iso()
+            save_monthly_store(store)
+            await query.answer("Пересчитано")
+            await send_month_report_messages(month, store, entry)
+            return
+        await query.answer("Некорректная кнопка", show_alert=True)
+    except DataCorrupted as e:
+        await query.answer(f"Ошибка данных: {e.reason}", show_alert=True)
+    except (ValueError, KeyError, IndexError) as e:
+        await query.answer(f"Ошибка: {e}", show_alert=True)
 
 
 # ============================================================
@@ -3884,6 +4418,7 @@ async def cb_result(query: types.CallbackQuery):
                 f"✅ Матч записан ({len(written)} игроков) — {game_title(game)}.\n" + ("Результативные: " + ", ".join(scorers) if scorers else "Голов и передач нет."),
                 kb([[btn("💰 Рассчитать оплату", "pm:menu")], [btn("⬅️ Меню", "m:home")]]),
             )
+            await process_monthly_reports()
     except DataCorrupted as e:
         return await report_data_error(e, query=query)
     except (ValueError, IndexError, KeyError) as e:
@@ -4260,6 +4795,7 @@ async def cb_past(query: types.CallbackQuery):
                     query, f"✅ Прошлая игра записана ({len(written)} игроков) — {game_title(game)}.\n"
                     + ("Результативные: " + ", ".join(scorers) if scorers else "Голов и передач нет.")
                     + "\nТекущая игра и опрос не менялись.", kb([[btn("📚 История игр", "m:history"), btn("⬅️ Меню", "m:home")]]))
+                await process_monthly_reports()
     except DataCorrupted as e:
         return await report_data_error(e, query=query)
     except (ValueError, IndexError, KeyError) as e:
@@ -4531,6 +5067,7 @@ async def cmd_match(message: types.Message, command: CommandObject):
     if errors:
         lines.append(f"\nНе разобрал: {', '.join(errors)}")
     await message.answer("\n".join(lines))
+    await process_monthly_reports()
 
 
 @dp.message(Command("отменить"))
@@ -4694,6 +5231,7 @@ OWNER_MENU_COMMANDS = [
     ("past", "Записать прошлую игру"),
     ("players", "Игроки и привязки"),
     ("card", "Создать карточку публикации"),
+    ("month", "Итоги месяца"),
     ("help", "Help — инструкция администратора"),
 ]
 
@@ -4947,6 +5485,10 @@ async def main():
     await notify_started(menu)
     await notify_archive()
     await notify_canonical()
+    try:
+        await process_monthly_reports()
+    except Exception as e:
+        print(f"[MONTH] startup check failed: {type(e).__name__}: {e}")
     try:
         data_runner = await start_data_read_server()
     except Exception as e:
