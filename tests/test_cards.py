@@ -61,6 +61,31 @@ class CardDrafts(Base):
         self.assertEqual(draft["caption_html"], "<b>Ноябрьский текст</b>")
         self.assertEqual(draft["source"], "photo_caption")
 
+    async def test_october_rating_is_a_second_independent_persistent_draft(self):
+        _, _, top = await self.create_october()
+        rating_message = card_command(photo_message(file_id="rating-file", unique_id="rating-unique"))
+        await B.cmd_card(rating_message, command("рейтинг"))
+
+        drafts = B.load_card_store()["drafts"]
+        self.assertEqual(len(drafts), 2)
+        rating = drafts[1]
+        self.assertNotEqual(top["id"], rating["id"])
+        self.assertNotEqual(top["photo_unique_id"], rating["photo_unique_id"])
+        self.assertEqual(rating["caption_text"], B.OCTOBER_RATING_TEXT)
+        self.assertEqual(rating["caption_html"], B.OCTOBER_RATING_HTML)
+        self.assertEqual(rating["source"], "october_2026_rating")
+        self.assertEqual(rating["status"], "draft")
+        self.assertEqual(len(rating_message.photo_answers), 1)
+        self.assertIn("card:pub:", " ".join(all_button_data(rating_message.photo_answers[0][2])))
+        self.assertTrue(any(name.startswith("card-drafts-") for name in os.listdir(B.BACKUP_DIR)))
+
+        await B.cb_card(FakeQuery(f"card:pub:{rating['id']}"))
+        saved = B.load_card_store()["drafts"]
+        self.assertEqual(saved[0]["id"], top["id"])
+        self.assertEqual(saved[0]["status"], "draft")
+        self.assertEqual(saved[1]["status"], "published")
+        self.assertEqual(len(self.fake.photos), 1)
+
     async def test_only_owner_private_can_create_or_publish(self):
         reply = photo_message()
         stranger = card_command(reply, user_id=777)
@@ -144,4 +169,3 @@ class CardDrafts(Base):
         self.assertEqual(len(B.load_card_store()["drafts"]), 1)
         self.assertTrue(second.answers)
         self.assertEqual(len(second.photo_answers), 1)
-
