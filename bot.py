@@ -7,11 +7,13 @@ import asyncio
 import datetime
 import hashlib
 import hmac
+import html
 import json
 import math
 import os
 import random
 import re
+import secrets
 import shutil
 import tempfile
 from itertools import combinations
@@ -27,7 +29,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 # Будущие даты в номере не использовать. История: 2026-10-01 (меню, игроки в /data, фактический состав); 2026-10-02 (нумерация игр,
 # История игр, публикация статистики, редактирование игрока); 2026-10-03 … 2026-10-06 — версии с заранее проставленными датами
 # (архив игр №1–4, /отменить без освобождения номера); начиная с 2026-10-03.1 — по реальной дате деплоя.
-BOT_VERSION = "2026-10-31"
+BOT_VERSION = "2026-11-01"
 
 # === Настройки из Secrets ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -49,7 +51,42 @@ GAME_ARCHIVE_FILE = os.path.join(DATA_DIR, "game_archive.json")
 META_FILE = os.path.join(DATA_DIR, "ui_meta.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 GAMES_FILE = os.path.join(DATA_DIR, "games.json")        # журнал состоявшихся игр (футбольных вечеров) с постоянными номерами
+CARD_DRAFTS_FILE = os.path.join(DATA_DIR, "card_drafts.json")
 DATA_READ_NAMES = frozenset({"games.json", "players.json", "game.json", "game_archive.json", "poll_state.json", "stats.json"})
+
+OCTOBER_CARD_TEXT = (
+    "ЛЕСТЕХ | ИТОГИ ОКТЯБРЯ 2026\n\n"
+    "Сентябрьское серебро превратилось в октябрьское золото!\n\n"
+    "Четыре футбольных понедельника, 22 участника и настоящая борьба за лидерство до последнего гола!\n\n"
+    "Ковалёв М. — 44 очка!\n"
+    "Уверенно провёл месяц и поднялся на вершину рейтинга!\n\n"
+    "Расчётов А. — 43 очка!\n"
+    "Всего ОДНО очко отделило его от первого места. Вот это конкуренция!\n\n"
+    "Сунгатов Р. — 36 очков!\n"
+    "Заслуженная бронза и место среди лучших игроков октября!\n\n"
+    "⚽ Из 22 участников только 9 сыграли все четыре матча. Именно среди них определялись победители — ведь важны не только голы и передачи, но и постоянство!\n\n"
+    "Поздравляем нашу тройку призёров!\n\n"
+    "Спасибо всем за игру, борьбу, красивые голы и атмосферу футбольных понедельников!\n\n"
+    "Впереди ноябрь — новый месяц, новые матчи и новая борьба за пьедестал!\n\n"
+    "⚽ Мяч | Лестех"
+)
+OCTOBER_CARD_HTML = (
+    "<b>ЛЕСТЕХ | ИТОГИ ОКТЯБРЯ 2026</b>\n\n"
+    "<b>Сентябрьское серебро превратилось в октябрьское золото!</b>\n\n"
+    "Четыре футбольных понедельника, 22 участника и настоящая борьба за лидерство до последнего гола!\n\n"
+    "<b>Ковалёв М. — 44 очка!</b>\n"
+    "Уверенно провёл месяц и поднялся на вершину рейтинга!\n\n"
+    "<b>Расчётов А. — 43 очка!</b>\n"
+    "Всего ОДНО очко отделило его от первого места. Вот это конкуренция!\n\n"
+    "<b>Сунгатов Р. — 36 очков!</b>\n"
+    "Заслуженная бронза и место среди лучших игроков октября!\n\n"
+    "⚽ Из 22 участников только 9 сыграли все четыре матча. Именно среди них определялись победители — ведь важны не только голы и передачи, но и постоянство!\n\n"
+    "<b>Поздравляем нашу тройку призёров!</b>\n\n"
+    "Спасибо всем за игру, борьбу, красивые голы и атмосферу футбольных понедельников!\n\n"
+    "<b>Впереди ноябрь — новый месяц, новые матчи и новая борьба за пьедестал!</b>\n\n"
+    "⚽ <b>Мяч | Лестех</b>"
+)
+CARD_CAPTION_LIMIT = 1024
 
 
 def data_read_files() -> dict:
@@ -152,6 +189,7 @@ dp = Dispatcher()
 
 POLL_LOCK = asyncio.Lock()
 PUBLISH_LOCK = asyncio.Lock()
+CARD_PUBLISH_LOCK = asyncio.Lock()
 RECORD_LOCK = asyncio.Lock()
 # Ожидание текстового ввода от Дмитрия (в памяти: после перезапуска
 # просто начать действие заново).
@@ -285,6 +323,77 @@ def load_offset() -> int:
 def save_offset(offset: int):
     with open(OFFSET_FILE, "w") as f:
         f.write(str(offset))
+
+
+# ============================================================
+# Карточки: постоянные owner-only черновики публикаций
+# ============================================================
+
+CARD_STATUSES = frozenset({"draft", "publishing", "uncertain", "published", "cancelled"})
+
+
+def validate_card_store(data: dict):
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("drafts"), list):
+        raise ValueError("ожидался объект карточек версии 1 со списком drafts")
+    ids = set()
+    for draft in data["drafts"]:
+        if not isinstance(draft, dict):
+            raise ValueError("запись карточки не является объектом")
+        draft_id = draft.get("id")
+        if not isinstance(draft_id, str) or not re.fullmatch(r"[0-9a-f]{16}", draft_id) or draft_id in ids:
+            raise ValueError("id карточки отсутствует, повторяется или имеет неверный формат")
+        ids.add(draft_id)
+        if draft.get("status") not in CARD_STATUSES:
+            raise ValueError(f"карточка {draft_id}: неверный status")
+        for field in ("photo_file_id", "photo_unique_id", "caption_text", "caption_html", "created_at"):
+            if not isinstance(draft.get(field), str) or not draft[field]:
+                raise ValueError(f"карточка {draft_id}: неверное поле {field}")
+        if len(draft["caption_text"]) > CARD_CAPTION_LIMIT:
+            raise ValueError(f"карточка {draft_id}: подпись длиннее лимита Telegram")
+        if draft.get("status") == "published":
+            if not isinstance(draft.get("published_message_id"), int):
+                raise ValueError(f"карточка {draft_id}: нет message_id публикации")
+            if draft.get("published_chat_id") != CHAT_ID:
+                raise ValueError(f"карточка {draft_id}: неверный чат публикации")
+
+
+def load_card_store() -> dict:
+    data = load_json_strict(CARD_DRAFTS_FILE)
+    if data is _MISSING:
+        return {"version": 1, "drafts": []}
+    try:
+        validate_card_store(data)
+    except ValueError as e:
+        raise DataCorrupted(CARD_DRAFTS_FILE, str(e))
+    return data
+
+
+def save_card_store(data: dict):
+    validate_card_store(data)
+    backup_file(CARD_DRAFTS_FILE, "card-drafts")
+    save_json(CARD_DRAFTS_FILE, data)
+
+
+def card_by_id(store: dict, draft_id: str) -> dict | None:
+    return next((draft for draft in store["drafts"] if draft.get("id") == draft_id), None)
+
+
+def new_card_draft(photo_file_id: str, photo_unique_id: str, caption_text: str, caption_html: str) -> dict:
+    if not photo_file_id or not photo_unique_id:
+        raise ValueError("Telegram не передал идентификатор фотографии")
+    if not caption_text.strip():
+        raise ValueError("Подпись карточки пуста")
+    if len(caption_text) > CARD_CAPTION_LIMIT:
+        raise ValueError(f"Подпись длиннее лимита Telegram ({len(caption_text)}/{CARD_CAPTION_LIMIT})")
+    return {
+        "id": secrets.token_hex(8),
+        "photo_file_id": photo_file_id,
+        "photo_unique_id": photo_unique_id,
+        "caption_text": caption_text,
+        "caption_html": caption_html,
+        "status": "draft",
+        "created_at": now_iso(),
+    }
 
 
 # ============================================================
@@ -2173,6 +2282,19 @@ HELP_SECTIONS = {
         "кнопки 12–18.\n\n"
         "Ограничения: больше 30 игроков бот не принимает; если состав изменился, расчёт нужно открыть заново."
     ),
+    "cards": (
+        "🖼 КАРТОЧКИ\n\n"
+        "Постоянные черновики публикаций с фотографией. Только в вашей личке. Ответьте командой /карточка "
+        "непосредственно на октябрьскую фотографию: бот сохранит Telegram file_id, добавит утверждённый октябрьский "
+        "текст и пришлёт полный предпросмотр с кнопкой «📢 Опубликовать в общий чат». Само создание черновика ничего "
+        "в общий чат не отправляет.\n\n"
+        "Для следующих карточек: отправьте боту фотографию с готовой подписью и ответьте на неё /карточка новая — "
+        "бот сохранит подпись и её выделения без изменения кода. /карточки повторно показывает последний сохранённый "
+        "черновик после рестарта.\n\n"
+        "Публикация выполняется только кнопкой владельца. Перед отправкой состояние фиксируется на диске; повторное "
+        "нажатие блокируется. Если Telegram не подтвердил результат, бот не повторяет отправку вслепую. Опубликованная "
+        "запись и message_id сохраняются. Черновик можно отменить до начала публикации."
+    ),
     "misc": (
         "🔧 СЛУЖЕБНЫЕ\n\n"
         "/start — приветствие и панель администратора\n"
@@ -2185,13 +2307,15 @@ HELP_SECTIONS = {
         "При каждом запуске бот присылает вам сообщение «🟢 Мяч запущен» с состоянием статистики, "
         "игроков и меню.\n\n"
         "Данные в /data: stats.json (статистика), players.json (игроки), poll_state.json (опрос и голоса), "
-        "game.json / game_archive.json (фактический состав), games.json (журнал игр с номерами), guests.json, backups/.\n\n"
+        "game.json / game_archive.json (фактический состав), games.json (журнал игр с номерами), "
+        "card_drafts.json (черновики карточек), guests.json, backups/.\n\n"
         "Правило: любая новая admin-функция добавляется в этот Help в том же изменении."
     ),
 }
 HELP_TITLES = {
     "poll": "🗳 Опрос", "players": "👥 Игроки", "split": "⚖️ Составы", "match": "⚽ Матч",
-    "stats": "📊 Статистика", "history": "📚 История игр", "pay": "💰 Оплата", "misc": "🔧 Служебные",
+    "stats": "📊 Статистика", "history": "📚 История игр", "pay": "💰 Оплата",
+    "cards": "🖼 Карточки", "misc": "🔧 Служебные",
 }
 HELP_ALL_TEXT = "\n".join(HELP_SECTIONS.values())
 
@@ -2307,7 +2431,7 @@ def main_panel() -> types.InlineKeyboardMarkup:
         [btn("⚖️ Составы (разделить)", "m:split"), btn("⚙️ Изменить состав", "m:squad")],
         [btn("⚽ Внести результат матча", "m:result"), btn("💰 Рассчитать оплату", "m:pay")],
         [btn("📊 Статистика", "m:stats"), btn("📚 История игр", "m:history")],
-        [btn("🕘 Записать прошлую игру", "m:past")],
+        [btn("🕘 Записать прошлую игру", "m:past"), btn("🖼 Карточки", "m:cards")],
         [btn("❓ Help", "m:help")],
     ])
 
@@ -2427,6 +2551,8 @@ async def cb_panel(query: types.CallbackQuery):
         await show_history_list(query, 0)
     elif action == "past":
         await show_past_list(query)
+    elif action == "cards":
+        await show_latest_card(query.message)
     elif action == "poll":
         today = datetime.datetime.now(YEKB_TZ).date()
         monday = poll_target_monday(today)
@@ -2455,6 +2581,192 @@ async def cb_panel(query: types.CallbackQuery):
 @dp.callback_query(F.data == "noop")
 async def cb_noop(query: types.CallbackQuery):
     await query.answer("Это действие уже выполнено")
+
+
+# ============================================================
+# Карточки: фото + подпись + ручная owner-only публикация
+# ============================================================
+
+def card_markup(draft: dict) -> types.InlineKeyboardMarkup:
+    status = draft["status"]
+    if status == "draft":
+        first = btn("📢 Опубликовать в общий чат", f"card:pub:{draft['id']}")
+        second = btn("❌ Отменить черновик", f"card:cancel:{draft['id']}")
+        return kb([[first], [second]])
+    if status == "published":
+        return kb([[btn("✅ Опубликовано в общем чате", "noop")]])
+    if status == "cancelled":
+        return kb([[btn("❌ Черновик отменён", "noop")]])
+    return kb([[btn("⚠️ Повторная отправка заблокирована", "noop")]])
+
+
+async def send_card_preview(message: types.Message, draft: dict):
+    return await message.answer_photo(
+        photo=draft["photo_file_id"],
+        caption=draft["caption_html"],
+        parse_mode="HTML",
+        reply_markup=card_markup(draft),
+    )
+
+
+async def show_latest_card(message: types.Message):
+    try:
+        store = load_card_store()
+    except DataCorrupted as e:
+        return await message.answer(f"⚠️ Черновики карточек недоступны: {e.reason}. Файл не изменён.")
+    available = [d for d in store["drafts"] if d["status"] != "cancelled"]
+    if not available:
+        return await message.answer(
+            "Черновиков карточек пока нет. Ответьте /карточка непосредственно на октябрьскую фотографию."
+        )
+    await send_card_preview(message, available[-1])
+
+
+@dp.message(Command("карточка", "card"))
+async def cmd_card(message: types.Message, command: CommandObject):
+    if not is_owner_private(message):
+        return
+    reply = message.reply_to_message
+    if reply is None or not reply.photo:
+        return await message.answer(
+            "Ответьте командой /карточка непосредственно на октябрьскую фотографию. "
+            "Для будущей карточки с готовой подписью: /карточка новая."
+        )
+    mode = (command.args or "").strip().casefold()
+    if mode not in ("", "новая", "new"):
+        return await message.answer("Формат: /карточка или /карточка новая — в ответ на фотографию.")
+    if mode:
+        if not reply.caption:
+            return await message.answer("Для /карточка новая у фотографии должна быть готовая подпись.")
+        caption_text = reply.caption
+        caption_html = getattr(reply, "html_caption", None) or html.escape(reply.caption)
+    else:
+        caption_text = OCTOBER_CARD_TEXT
+        caption_html = OCTOBER_CARD_HTML
+    photo = reply.photo[-1]
+    try:
+        store = load_card_store()
+        existing = next((d for d in reversed(store["drafts"])
+                         if d["photo_unique_id"] == photo.file_unique_id
+                         and d["caption_text"] == caption_text and d["status"] != "cancelled"), None)
+        if existing is not None:
+            if existing["status"] == "draft":
+                await message.answer("Этот черновик уже сохранён. Показываю его повторно.")
+                return await send_card_preview(message, existing)
+            if existing["status"] == "published":
+                return await message.answer("Эта карточка уже опубликована; повторная отправка заблокирована.")
+            return await message.answer(
+                "По этой карточке результат отправки не подтверждён. Повторная отправка заблокирована."
+            )
+        draft = new_card_draft(photo.file_id, photo.file_unique_id, caption_text, caption_html)
+        draft["source"] = "october_2026" if not mode else "photo_caption"
+        store["drafts"].append(draft)
+        save_card_store(store)
+    except DataCorrupted as e:
+        return await message.answer(f"⚠️ Черновик не создан: {e.reason}. Исходный файл не изменён.")
+    except ValueError as e:
+        return await message.answer(f"⚠️ Черновик не создан: {e}")
+    await send_card_preview(message, draft)
+    print(f"[CARD] draft {draft['id']} previewed to owner; status=draft")
+
+
+@dp.message(Command("карточки", "cards"))
+async def cmd_cards(message: types.Message):
+    if not is_owner_private(message):
+        return
+    await show_latest_card(message)
+
+
+@dp.callback_query(F.data.startswith("card:"))
+async def cb_card(query: types.CallbackQuery):
+    if not owner_cb_ok(query):
+        return await query.answer("Недоступно", show_alert=True)
+    try:
+        _, action, draft_id = query.data.split(":", 2)
+    except ValueError:
+        return await query.answer("Некорректная кнопка", show_alert=True)
+    async with CARD_PUBLISH_LOCK:
+        try:
+            store = load_card_store()
+        except DataCorrupted as e:
+            return await query.answer(f"Ошибка черновиков: {e.reason}", show_alert=True)
+        draft = card_by_id(store, draft_id)
+        if draft is None:
+            return await query.answer("Черновик не найден", show_alert=True)
+        if action == "cancel":
+            if draft["status"] != "draft":
+                return await query.answer("Этот черновик уже нельзя отменить", show_alert=True)
+            draft["status"] = "cancelled"
+            draft["cancelled_at"] = now_iso()
+            save_card_store(store)
+            try:
+                await query.message.edit_reply_markup(reply_markup=card_markup(draft))
+            except Exception:
+                pass
+            return await query.answer("Черновик отменён")
+        if action != "pub":
+            return await query.answer("Некорректная кнопка", show_alert=True)
+        if draft["status"] == "published":
+            try:
+                await query.message.edit_reply_markup(reply_markup=card_markup(draft))
+            except Exception:
+                pass
+            return await query.answer("Уже опубликовано")
+        if draft["status"] in ("publishing", "uncertain"):
+            return await query.answer(
+                "Результат предыдущей отправки не подтверждён. Повтор заблокирован.", show_alert=True
+            )
+        if draft["status"] != "draft":
+            return await query.answer("Черновик отменён", show_alert=True)
+
+        # Сначала фиксируем намерение на диске. Если процесс остановится после Telegram send,
+        # состояние publishing переживёт рестарт и не даст отправить карточку повторно вслепую.
+        draft["status"] = "publishing"
+        draft["publish_started_at"] = now_iso()
+        save_card_store(store)
+        try:
+            sent = await bot.send_photo(
+                CHAT_ID,
+                photo=draft["photo_file_id"],
+                caption=draft["caption_html"],
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            print(f"Не удалось подтвердить публикацию карточки {draft_id}: {type(e).__name__}")
+            try:
+                latest = load_card_store()
+                current = card_by_id(latest, draft_id)
+                if current is not None and current["status"] == "publishing":
+                    current["status"] = "uncertain"
+                    current["publish_failed_at"] = now_iso()
+                    save_card_store(latest)
+                    draft = current
+            except Exception as save_error:
+                print(f"Не удалось сохранить неопределённый статус карточки {draft_id}: {type(save_error).__name__}")
+            try:
+                await query.message.edit_reply_markup(reply_markup=card_markup(draft))
+            except Exception:
+                pass
+            return await query.answer(
+                "Telegram не подтвердил результат. Повторная отправка заблокирована.", show_alert=True
+            )
+
+        draft["status"] = "published"
+        draft["published_at"] = now_iso()
+        draft["published_chat_id"] = sent.chat.id
+        draft["published_message_id"] = sent.message_id
+        try:
+            save_card_store(store)
+        except Exception as e:
+            print(f"Карточка {draft_id} отправлена, но подтверждение не сохранено: {type(e).__name__}")
+            return await query.answer(
+                "Карточка отправлена, но подтверждение не сохранено. Повтор заблокирован.", show_alert=True
+            )
+    try:
+        await query.message.edit_reply_markup(reply_markup=card_markup(draft))
+    except Exception as e:
+        print(f"Не удалось обновить кнопку карточки {draft_id}: {type(e).__name__}")
+    await query.answer("Опубликовано")
 
 
 # ============================================================
@@ -4360,6 +4672,7 @@ OWNER_MENU_COMMANDS = [
     ("history", "История игр"),
     ("past", "Записать прошлую игру"),
     ("players", "Игроки и привязки"),
+    ("card", "Создать карточку публикации"),
     ("help", "Help — инструкция администратора"),
 ]
 

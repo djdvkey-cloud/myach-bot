@@ -32,6 +32,7 @@ OWNER, CHAT = B.OWNER_ID, B.CHAT_ID
 class FakeBot:
     def __init__(self):
         self.sent = []          # (chat_id, text)
+        self.photos = []
         self.polls = []
         self.fail_send = False
         self.probes = []
@@ -47,6 +48,12 @@ class FakeBot:
         if self.fail_send:
             raise RuntimeError("network down")
         self.sent.append((chat_id, text))
+
+    async def send_photo(self, chat_id, photo, caption=None, **kw):
+        if self.fail_send:
+            raise RuntimeError("network down")
+        self.photos.append((chat_id, photo, caption, kw))
+        return pytypes.SimpleNamespace(message_id=len(self.photos), chat=pytypes.SimpleNamespace(id=chat_id))
 
     async def send_poll(self, chat_id, question, options, is_anonymous=True, **kw):
         self.polls.append((chat_id, question, options))
@@ -92,18 +99,28 @@ class FakeBot:
 
 
 class FakeMsg:
-    def __init__(self, chat_id, chat_type="private", user_id=None, text="", first_name="Тест"):
+    def __init__(self, chat_id, chat_type="private", user_id=None, text="", first_name="Тест",
+                 reply_to_message=None, photo=None, caption=None, html_caption=None):
         self.chat = pytypes.SimpleNamespace(id=chat_id, type=chat_type)
         self.from_user = pytypes.SimpleNamespace(id=user_id if user_id is not None else chat_id,
                                                  first_name=first_name, last_name=None, username=None)
         self.text = text
+        self.reply_to_message = reply_to_message
+        self.photo = photo
+        self.caption = caption
+        self.html_caption = html_caption
         self.answers = []       # (text, markup)
+        self.photo_answers = []
         self.edits = []
         self.markup_edits = []
         self.message_id = 1
 
     async def answer(self, text, reply_markup=None, **kw):
         self.answers.append((text, reply_markup))
+        return FakeMsg(self.chat.id, self.chat.type)
+
+    async def answer_photo(self, photo, caption=None, reply_markup=None, **kw):
+        self.photo_answers.append((photo, caption, reply_markup, kw))
         return FakeMsg(self.chat.id, self.chat.type)
 
     async def edit_text(self, text, reply_markup=None, **kw):
@@ -162,6 +179,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
             "POLL_STATE_FILE": "poll_state.json", "GUESTS_FILE": "guests.json",
             "PLAYERS_FILE": "players.json", "GAME_FILE": "game.json",
             "GAME_ARCHIVE_FILE": "game_archive.json", "GAMES_FILE": "games.json", "META_FILE": "ui_meta.json",
+            "CARD_DRAFTS_FILE": "card_drafts.json",
             "BACKUP_DIR": "backups",
         }
         for name, val in paths.items():

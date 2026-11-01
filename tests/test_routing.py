@@ -17,7 +17,7 @@ import bot as B  # noqa: E402
 from aiogram import Bot  # noqa: E402
 from aiogram.client.session.base import BaseSession  # noqa: E402
 from aiogram.methods import TelegramMethod  # noqa: E402
-from aiogram.types import (CallbackQuery, Chat, Message, MessageEntity, MenuButtonDefault,  # noqa: E402
+from aiogram.types import (CallbackQuery, Chat, Message, MessageEntity, MenuButtonDefault, PhotoSize,  # noqa: E402
                            Poll, PollAnswer, PollOption, Update, User)
 
 OWNER, CHAT = B.OWNER_ID, B.CHAT_ID
@@ -45,6 +45,11 @@ class RecSession(BaseSession):
         if name in ("SendMessage", "EditMessageText"):
             return Message(message_id=self.counter, date=now, chat=Chat(id=chat_id, type="private"),
                            text=getattr(method, "text", ""))
+        if name == "SendPhoto":
+            return Message(message_id=self.counter, date=now,
+                           chat=Chat(id=chat_id, type="private" if int(chat_id) > 0 else "supergroup"),
+                           caption=getattr(method, "caption", None),
+                           photo=[PhotoSize(file_id="sent", file_unique_id="sent-u", width=100, height=100)])
         if name == "SendPoll":
             return Message(message_id=self.counter, date=now, chat=Chat(id=chat_id, type="supergroup"),
                            poll=Poll(id=f"p{self.counter}", question=method.question,
@@ -80,13 +85,25 @@ def cb_update(uid, data, chat_type="private", chat_id=None, n=1):
                                                             data=data, message=msg))
 
 
+def card_update(uid=OWNER, chat_id=OWNER, chat_type="private", n=1):
+    photo = Message(message_id=40, date=dt.datetime.now(dt.timezone.utc),
+                    chat=Chat(id=chat_id, type=chat_type), from_user=user(uid),
+                    photo=[PhotoSize(file_id="october-file", file_unique_id="october-unique", width=100, height=100)])
+    command = Message(message_id=41, date=dt.datetime.now(dt.timezone.utc),
+                      chat=Chat(id=chat_id, type=chat_type), from_user=user(uid), text="/карточка",
+                      entities=[MessageEntity(type="bot_command", offset=0, length=len("/карточка"))],
+                      reply_to_message=photo)
+    return Update(update_id=n, message=command)
+
+
 class RoutingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="myach-route-")
         self.patches = []
         paths = {"STATS_FILE": "stats.json", "LAST_POLL_FILE": "last_poll.txt", "POLL_STATE_FILE": "poll_state.json",
                  "GUESTS_FILE": "guests.json", "PLAYERS_FILE": "players.json", "GAME_FILE": "game.json",
-                 "GAME_ARCHIVE_FILE": "game_archive.json", "GAMES_FILE": "games.json", "META_FILE": "ui_meta.json", "BACKUP_DIR": "backups"}
+                 "GAME_ARCHIVE_FILE": "game_archive.json", "GAMES_FILE": "games.json", "META_FILE": "ui_meta.json",
+                 "CARD_DRAFTS_FILE": "card_drafts.json", "BACKUP_DIR": "backups"}
         for name, val in paths.items():
             p = mock.patch.object(B, name, os.path.join(self.tmp, val))
             p.start()
@@ -180,6 +197,23 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.sent("EditMessageReplyMarkup"))
         await self.feed(cb_update(OWNER, pub))
         self.assertEqual([c for c in self.sent() if c.chat_id == CHAT], [])
+
+    async def test_card_preview_routes_only_to_owner_and_publish_is_button_only(self):
+        await self.feed(card_update())
+        previews = self.sent("SendPhoto")
+        self.assertEqual(len(previews), 1)
+        self.assertEqual(previews[0].chat_id, OWNER)
+        self.assertEqual([c for c in previews if c.chat_id == CHAT], [])
+        draft = B.load_card_store()["drafts"][0]
+        await self.feed(cb_update(OWNER, f"card:pub:{draft['id']}"))
+        published = [c for c in self.sent("SendPhoto") if c.chat_id == CHAT]
+        self.assertEqual(len(published), 1)
+
+    async def test_card_command_is_silent_outside_owner_private(self):
+        await self.feed(card_update(uid=555, chat_id=555))
+        self.assertEqual(self.session.calls, [])
+        await self.feed(card_update(uid=OWNER, chat_id=CHAT, chat_type="group"))
+        self.assertEqual(self.session.calls, [])
 
     async def test_menu_setup_real_methods(self):
         report = await B.setup_menu()
