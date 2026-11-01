@@ -1,6 +1,6 @@
 # HANDOFF — 03 · Боты · «Мяч»
 
-Последнее обновление: 2026-10-22 (версия `2026-10-22.1`, разделы 11–16; production — Amvera Miami-0 `myach-reserve`). Документ описывает **текущее** состояние бота «Мяч»
+Последнее обновление: 2026-11-01 (раздел 18; production — Amvera Miami-0 `myach-reserve`). Документ описывает **текущее** состояние бота «Мяч»
 (Telegram). SPORTBOT/MAX и «Шарик» здесь не описаны. В репозиторий не кладутся токены,
 телефоны и списки username игроков.
 
@@ -320,3 +320,12 @@ Production: Amvera **`5962008`** (до него `5d7447d`, `7061421`, `9ee0d95`,
 - До изменения сохранён проверенный слепок реальных `games.json`, `players.json`, `stats.json` в `C:\Users\User\Documents\myach-bot-work-backups\2026-10-31-live-before-production-fixes`. После изменения — `2026-10-31-live-after-production-fixes`.
 - Production после выпуска: все 8 игр сохранены; у игры №8 изменено только `date` с `2026-10-31` на `2026-10-26`; в `players.json` добавлен только `Азиз` (`pid: 27`, `next_pid: 28`); `stats.json` побайтно не изменился (SHA-256 `3def062cd6b081a558d29a1fa23dcf8736cf8864b47cb58dbfc37320a1b923c2`).
 - Выпускные коммиты: `8cc222d` (исправления), `60c78f7` (порт HTTPS), `12f5074` (одноразовое строго проверяемое применение production-данных). Одноразовый код после успешной сверки удалён; никаких тестовых игр и сообщений в общий Telegram-чат не создавалось.
+
+## 18. Постоянный доступ CODEX · БОТЫ к live Data (2026-11-01)
+
+- `DATA_READ_TOKEN` однократно заменён в secret RUN env проекта Amvera `myach-reserve`; значение не выводилось и не сохранялось в Git, HANDOFF или отчётах. Игровой код и production-данные не изменялись.
+- Локальная копия защищена Windows DPAPI (`CurrentUser`) в `C:\Users\User\.codex-terminal\secrets\myach-data-token.dpapi`. Расшифровка возможна только в контексте пользователя HOME-PC; в файл записан только DPAPI-шифротекст.
+- `C:\Users\User\Codex-Migration\launchers\Initialize-MyachDataAccess.ps1` загружает ключ и HTTPS-адрес только в окружение текущего процесса. `Start-CodexBots.ps1` вызывает загрузчик до запуска Codex, поэтому обычный ярлык `CODEX — Проекты` автоматически передаёт доступ вкладке `CODEX · БОТЫ`.
+- Реальная проверка после полного закрытия Windows Terminal и повторного запуска обычного ярлыка: новая вкладка получила 64-символьный ключ без ручного ввода; `tools/read_live_data.py` повторно прочитал актуальные `games.json`, `players.json`, `stats.json`. SHA-256: games `8cd6fc52a857807856945aca22fcf7b2fbf651839c28dfde1e413571a4b959a2`, players `080e7e40d9f876d2d58a9ac4ec2df33bb1c2c94929d6f9101e78c2e3704598ee`, stats `3def062cd6b081a558d29a1fa23dcf8736cf8864b47cb58dbfc37320a1b923c2`.
+- После штатного перезапуска Amvera: `RUNNING`, `Instances=1`; read-only endpoint поднят на порту 8080, планировщик polling запущен, постоянных ошибок и Telegram `Conflict` в проверенном окне логов нет.
+- Резервная копия изменённых запускателей до настройки: `C:\Users\User\Codex-Migration\backups\myach-dpapi-20261101_132240`.
